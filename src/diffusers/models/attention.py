@@ -968,6 +968,9 @@ class BasicTransformerBlock(nn.Module):
         class_labels: Optional[torch.LongTensor] = None,
         added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        # 如果不考虑归一化，这里实际上就是
+        # 自注意力（残差连接）-> 交叉注意力（残差连接）-> 前馈网络（残差连接）
+
         if cross_attention_kwargs is not None:
             if cross_attention_kwargs.get("scale", None) is not None:
                 logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
@@ -999,6 +1002,7 @@ class BasicTransformerBlock(nn.Module):
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
         # 1. Prepare GLIGEN inputs
+        # gligen用于控制图像生成，使其符合特定的图像布局或对象位置要求
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
@@ -1014,8 +1018,11 @@ class BasicTransformerBlock(nn.Module):
         elif self.norm_type == "ada_norm_single":
             attn_output = gate_msa * attn_output
 
+        # 残差连接
         hidden_states = attn_output + hidden_states
         if hidden_states.ndim == 4:
+            # 如果hidden_states是4维的，那么将第1维（索引为1）压缩掉。
+            # 例如，如果形状是[batch_size, 1, sequence_length, channels]，那么压缩后变成[batch_size, sequence_length, channels]
             hidden_states = hidden_states.squeeze(1)
 
         # 1.2 GLIGEN Control

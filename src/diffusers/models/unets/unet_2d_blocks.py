@@ -1169,6 +1169,7 @@ class CrossAttnDownBlock2D(nn.Module):
         upcast_attention: bool = False,
         attention_type: str = "default",
     ):
+        # unet中使用的降采样层，包含多个transformer层和resnet层
         super().__init__()
         resnets = []
         attentions = []

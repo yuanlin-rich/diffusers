@@ -1145,6 +1145,7 @@ class AttnDownBlock2D(nn.Module):
 
 
 class CrossAttnDownBlock2D(nn.Module):
+    # unet网络的降采样模块，包含resent和transformer层
     def __init__(
         self,
         in_channels: int,
@@ -1169,16 +1170,21 @@ class CrossAttnDownBlock2D(nn.Module):
         upcast_attention: bool = False,
         attention_type: str = "default",
     ):
-        # unet中使用的降采样层，包含多个transformer层和resnet层
         super().__init__()
         resnets = []
         attentions = []
 
+        # 是否使用cross attention机制，这里设置为True
         self.has_cross_attention = True
+        
+        # 设置注意力头的数量
         self.num_attention_heads = num_attention_heads
+
+        # 每个transformer中有多少层
         if isinstance(transformer_layers_per_block, int):
             transformer_layers_per_block = [transformer_layers_per_block] * num_layers
 
+        # 共有多少层，每层都是有resent和transformer组成，默认只有一层
         for i in range(num_layers):
             in_channels = in_channels if i == 0 else out_channels
             resnets.append(
@@ -1195,6 +1201,7 @@ class CrossAttnDownBlock2D(nn.Module):
                     pre_norm=resnet_pre_norm,
                 )
             )
+            # 是否使用双重cross attention机制
             if not dual_cross_attention:
                 attentions.append(
                     Transformer2DModel(
@@ -1221,9 +1228,11 @@ class CrossAttnDownBlock2D(nn.Module):
                         norm_num_groups=resnet_groups,
                     )
                 )
+        # 只有放到nn.ModuleList才能参与优化
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
+        # 是否添加降采样模块，默认添加，这里的降采样默认是二分之一降采样
         if add_downsample:
             self.downsamplers = nn.ModuleList(
                 [
@@ -1251,12 +1260,14 @@ class CrossAttnDownBlock2D(nn.Module):
             if cross_attention_kwargs.get("scale", None) is not None:
                 logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
 
+        # 保存每个层的输出，用于unets中的skip connection
         output_states = ()
 
         blocks = list(zip(self.resnets, self.attentions))
 
         for i, (resnet, attn) in enumerate(blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
+                # 是否开启了梯度计算以及梯度点检查
                 hidden_states = self._gradient_checkpointing_func(resnet, hidden_states, temb)
                 hidden_states = attn(
                     hidden_states,
@@ -1278,17 +1289,21 @@ class CrossAttnDownBlock2D(nn.Module):
                 )[0]
 
             # apply additional residuals to the output of the last pair of resnet and attention blocks
+            # 最后一层的时候，添加额外的残差连接
             if i == len(blocks) - 1 and additional_residuals is not None:
                 hidden_states = hidden_states + additional_residuals
 
+            # 残差连接
             output_states = output_states + (hidden_states,)
 
+        # 如果存在降采样层，则做降采样
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
                 hidden_states = downsampler(hidden_states)
 
             output_states = output_states + (hidden_states,)
 
+        # 返回整个模块的输出以及每一层的输出，每一层的属于用于unet中的 skip connection
         return hidden_states, output_states
 
 

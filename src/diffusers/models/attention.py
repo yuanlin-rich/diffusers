@@ -811,20 +811,43 @@ class BasicTransformerBlock(nn.Module):
         attention_out_bias: bool = True,
     ):
         super().__init__()
+
+        # 输入和输出的维度
         self.dim = dim
+
+        # 注意力头数量
         self.num_attention_heads = num_attention_heads
+
+        # 每个注意力头的维度
         self.attention_head_dim = attention_head_dim
+
+        # dropout的概率
         self.dropout = dropout
+
+        # 交叉注意力的维度
         self.cross_attention_dim = cross_attention_dim
+
+        # 激活函数
         self.activation_fn = activation_fn
+
+        # 注意力的偏置
         self.attention_bias = attention_bias
+
+        # 是否使用双重自注意力
         self.double_self_attention = double_self_attention
+
+        # 归一化的时候是否使用可以学习的参数
         self.norm_elementwise_affine = norm_elementwise_affine
+
+        # 位置编码类型
         self.positional_embeddings = positional_embeddings
+
+        # 位置编码维度
         self.num_positional_embeddings = num_positional_embeddings
         self.only_cross_attention = only_cross_attention
 
         # We keep these boolean flags for backward-compatibility.
+        # 和参数初始化相关
         self.use_ada_layer_norm_zero = (num_embeds_ada_norm is not None) and norm_type == "ada_norm_zero"
         self.use_ada_layer_norm = (num_embeds_ada_norm is not None) and norm_type == "ada_norm"
         self.use_ada_layer_norm_single = norm_type == "ada_norm_single"
@@ -845,6 +868,7 @@ class BasicTransformerBlock(nn.Module):
                 "If `positional_embedding` type is defined, `num_positition_embeddings` must also be defined."
             )
 
+        # 位置编码的类型，目前只支持sinusoidal
         if positional_embeddings == "sinusoidal":
             self.pos_embed = SinusoidalPositionalEmbedding(dim, max_seq_length=num_positional_embeddings)
         else:
@@ -852,6 +876,8 @@ class BasicTransformerBlock(nn.Module):
 
         # Define 3 blocks. Each block has its own normalization layer.
         # 1. Self-Attn
+        # 自注意力
+        # 归一化
         if norm_type == "ada_norm":
             self.norm1 = AdaLayerNorm(dim, num_embeds_ada_norm)
         elif norm_type == "ada_norm_zero":
@@ -868,6 +894,8 @@ class BasicTransformerBlock(nn.Module):
         else:
             self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
 
+        # 自注意力机制，如果制定了only_cross_attention，那么这里的attn1强行改为交叉注意力
+        # 否则是自注意力
         self.attn1 = Attention(
             query_dim=dim,
             heads=num_attention_heads,
@@ -880,10 +908,12 @@ class BasicTransformerBlock(nn.Module):
         )
 
         # 2. Cross-Attn
+        # 交叉注意力
         if cross_attention_dim is not None or double_self_attention:
             # We currently only use AdaLayerNormZero for self attention where there will only be one attention block.
             # I.e. the number of returned modulation chunks from AdaLayerZero would not make sense if returned during
             # the second cross attention block.
+            # 交叉注意力的归一化层
             if norm_type == "ada_norm":
                 self.norm2 = AdaLayerNorm(dim, num_embeds_ada_norm)
             elif norm_type == "ada_norm_continuous":
@@ -898,6 +928,7 @@ class BasicTransformerBlock(nn.Module):
             else:
                 self.norm2 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
 
+            # 交叉注意力机制，如果forward时没有传encoder_hidden_states，那么这里的attn2实际上就是自注意力
             self.attn2 = Attention(
                 query_dim=dim,
                 cross_attention_dim=cross_attention_dim if not double_self_attention else None,
@@ -916,6 +947,7 @@ class BasicTransformerBlock(nn.Module):
             self.attn2 = None
 
         # 3. Feed-forward
+        # feed forward网络的归一化层
         if norm_type == "ada_norm_continuous":
             self.norm3 = AdaLayerNormContinuous(
                 dim,
@@ -931,6 +963,7 @@ class BasicTransformerBlock(nn.Module):
         elif norm_type == "layer_norm_i2vgen":
             self.norm3 = None
 
+        # feed forward网络
         self.ff = FeedForward(
             dim,
             dropout=dropout,
@@ -941,6 +974,7 @@ class BasicTransformerBlock(nn.Module):
         )
 
         # 4. Fuser
+        # fuser用于融合视觉特征和对象特征，主要用于GLIGEN模型
         if attention_type == "gated" or attention_type == "gated-text-image":
             self.fuser = GatedSelfAttentionDense(dim, cross_attention_dim, num_attention_heads, attention_head_dim)
 
@@ -969,7 +1003,7 @@ class BasicTransformerBlock(nn.Module):
         added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # 如果不考虑归一化，这里实际上就是
-        # 自注意力（残差连接）-> 交叉注意力（残差连接）-> 前馈网络（残差连接）
+        # 自注意力（残差连接）-> 交叉注意力（残差连接）-> 前馈网络（残差连接）-> fuser（如果有的话）
 
         if cross_attention_kwargs is not None:
             if cross_attention_kwargs.get("scale", None) is not None:
@@ -998,6 +1032,7 @@ class BasicTransformerBlock(nn.Module):
         else:
             raise ValueError("Incorrect norm used")
 
+        # 位置编码
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
@@ -1006,6 +1041,7 @@ class BasicTransformerBlock(nn.Module):
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
+        # 第一层注意力机制
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,

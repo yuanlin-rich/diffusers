@@ -63,11 +63,12 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
         attention_bias (`bool`, *optional*):
             Configure if the `TransformerBlocks` attention should contain a bias parameter.
     """
-
+    # 2d tranformer模型
     _supports_gradient_checkpointing = True
     _no_split_modules = ["BasicTransformerBlock"]
     _skip_layerwise_casting_patterns = ["latent_image_embedding", "norm"]
 
+    # 这个装饰器自动将类初始化参数注册到配置中，使得配置管理更加方便。
     @register_to_config
     def __init__(
         self,
@@ -166,13 +167,17 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
         # a. Initialize the input blocks. b. Initialize the transformer blocks.
         # c. Initialize the output blocks and other projection blocks when necessary.
         if self.is_input_continuous:
+            # 连续输入：标准图像 (batch, channels, height, width)
             self._init_continuous_input(norm_type=norm_type)
         elif self.is_input_vectorized:
+            # 向量化输入：量化图像嵌入 (batch, num_image_vectors)
             self._init_vectorized_inputs(norm_type=norm_type)
         elif self.is_input_patches:
+            # Patch输入：图像分块处理
             self._init_patched_inputs(norm_type=norm_type)
 
     def _init_continuous_input(self, norm_type):
+        # 初始化连续输入处理模块(batch, channels, height, width)
         self.norm = torch.nn.GroupNorm(
             num_groups=self.config.norm_num_groups, num_channels=self.in_channels, eps=1e-6, affine=True
         )

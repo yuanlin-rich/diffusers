@@ -63,7 +63,22 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
         attention_bias (`bool`, *optional*):
             Configure if the `TransformerBlocks` attention should contain a bias parameter.
     """
-    # 2d tranformer模型
+    # 用于处理图像的2D Transformer模型，支持三种输入类型
+    
+    # 连续图像（continuous）：标准图像张量 (batch, channels, height, width)
+    
+    # 向量化离散图像（vectorized）：量化图像嵌入 (batch, num_image_vectors)
+    # 向量化离散图像是一种将图像表示为离散token序列的方式
+    # 通常用于VQ-VAE（向量量化变分自编码器）和VQ-GAN等模型。它不是连续的像素值，而是离散的编码索引。
+
+    # 分块图像（patched）：图像分块处理
+    # 原始图像：[batch, channels, H, W]
+    #         ↓ 切分成 N × N 的小块
+    # 分块图像：[batch, num_patches, patch_size × patch_size × channels]
+    #         ↓ 线性投影
+    # 最终序列：[batch, num_patches, embedding_dim]
+
+    # 支持梯度检查点，节省内存
     _supports_gradient_checkpointing = True
     _no_split_modules = ["BasicTransformerBlock"]
     _skip_layerwise_casting_patterns = ["latent_image_embedding", "norm"]
@@ -102,38 +117,46 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
 
         # Validate inputs.
         if patch_size is not None:
+            # 如果输入是分块图像
             if norm_type not in ["ada_norm", "ada_norm_zero", "ada_norm_single"]:
+                # 只支持这几类归一化方式
                 raise NotImplementedError(
                     f"Forward pass is not implemented when `patch_size` is not None and `norm_type` is '{norm_type}'."
                 )
             elif norm_type in ["ada_norm", "ada_norm_zero"] and num_embeds_ada_norm is None:
+                # 如果使用了ada_norm或ada_norm_zero归一化方式，必须指定num_embeds_ada_norm
                 raise ValueError(
                     f"When using a `patch_size` and this `norm_type` ({norm_type}), `num_embeds_ada_norm` cannot be None."
                 )
 
         # 1. Transformer2DModel can process both standard continuous images of shape `(batch_size, num_channels, width, height)` as well as quantized image embeddings of shape `(batch_size, num_image_vectors)`
         # Define whether input is continuous or discrete depending on configuration
+        # 判断输入属于哪种类型
         self.is_input_continuous = (in_channels is not None) and (patch_size is None)
         self.is_input_vectorized = num_vector_embeds is not None
         self.is_input_patches = in_channels is not None and patch_size is not None
 
         if self.is_input_continuous and self.is_input_vectorized:
+            # 不能同时制定连续输入和向量化输入
             raise ValueError(
                 f"Cannot define both `in_channels`: {in_channels} and `num_vector_embeds`: {num_vector_embeds}. Make"
                 " sure that either `in_channels` or `num_vector_embeds` is None."
             )
         elif self.is_input_vectorized and self.is_input_patches:
+            # 不能同时制定向量化输入和Patch输入
             raise ValueError(
                 f"Cannot define both `num_vector_embeds`: {num_vector_embeds} and `patch_size`: {patch_size}. Make"
                 " sure that either `num_vector_embeds` or `num_patches` is None."
             )
         elif not self.is_input_continuous and not self.is_input_vectorized and not self.is_input_patches:
+            # 必须是三种类型之一
             raise ValueError(
                 f"Has to define `in_channels`: {in_channels}, `num_vector_embeds`: {num_vector_embeds}, or patch_size:"
                 f" {patch_size}. Make sure that `in_channels`, `num_vector_embeds` or `num_patches` is not None."
             )
 
         if norm_type == "layer_norm" and num_embeds_ada_norm is not None:
+            # 同时指定了layer_norm和num_embeds_ada_norm，发出弃用警告
             deprecation_message = (
                 f"The configuration file of this model: {self.__class__} is outdated. `norm_type` is either not set or"
                 " incorrectly set to `'layer_norm'`. Make sure to set `norm_type` to `'ada_norm'` in the config."
@@ -145,18 +168,37 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
             norm_type = "ada_norm"
 
         # Set some common variables used across the board.
+        # 决定输入/输出投影使用线性层还是卷积层
         self.use_linear_projection = use_linear_projection
+
+        # 控制位置嵌入的插值比例（用于不同分辨率的图像）
         self.interpolation_scale = interpolation_scale
+
+        # 文本描述（caption）的通道数
         self.caption_channels = caption_channels
+
+        # 注意力头的数量
         self.num_attention_heads = num_attention_heads
+
+        # 每个注意力头的维度
         self.attention_head_dim = attention_head_dim
+
+        # 内部维度，等于注意力头数量乘以每个头的维度
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
+
+        # 输入通道数
         self.in_channels = in_channels
+
+        # 输出通道数，默认为输入通道数
         self.out_channels = in_channels if out_channels is None else out_channels
+
+        # 是否启用梯度检查点，默认不启用，可以开启以节省内存
         self.gradient_checkpointing = False
 
+        # 如果用户没有显式指定 use_additional_conditions
         if use_additional_conditions is None:
             if norm_type == "ada_norm_single" and sample_size == 128:
+                # 满足特定条件，则启用额外条件
                 use_additional_conditions = True
             else:
                 use_additional_conditions = False
@@ -182,10 +224,13 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
             num_groups=self.config.norm_num_groups, num_channels=self.in_channels, eps=1e-6, affine=True
         )
         if self.use_linear_projection:
+            # 使用线性层进行输入投影
             self.proj_in = torch.nn.Linear(self.in_channels, self.inner_dim)
         else:
+            # 使用卷积层进行输入投影
             self.proj_in = torch.nn.Conv2d(self.in_channels, self.inner_dim, kernel_size=1, stride=1, padding=0)
 
+        # 总共有num_layers个Transformer块
         self.transformer_blocks = nn.ModuleList(
             [
                 BasicTransformerBlock(
@@ -210,22 +255,38 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
         )
 
         if self.use_linear_projection:
+            # 使用线性层进行输出投影
             self.proj_out = torch.nn.Linear(self.inner_dim, self.out_channels)
         else:
+            # 使用卷积层进行输出投影
             self.proj_out = torch.nn.Conv2d(self.inner_dim, self.out_channels, kernel_size=1, stride=1, padding=0)
 
     def _init_vectorized_inputs(self, norm_type):
+
+        # sample_size：离散潜在空间的大小（如32×32）
+        # num_vector_embeds：VQ-VAE的codebook大小（如1024）
+        # 离散输入需要知道 序列长度（由sample_size决定）和 词汇表大小（由num_vector_embeds决定）。
         assert self.config.sample_size is not None, "Transformer2DModel over discrete input must provide sample_size"
         assert self.config.num_vector_embeds is not None, (
             "Transformer2DModel over discrete input must provide num_embed"
         )
 
+        # 潜在空间高度
         self.height = self.config.sample_size
+
+        # 潜在空间宽度
         self.width = self.config.sample_size
+
+        # 潜在空间像素总数，也就是序列长度
         self.num_latent_pixels = self.height * self.width
 
+        # 图像位置嵌入模块
+        # 三个作用：1）token嵌入 2）位置嵌入 3）将离散索引转换为连续嵌入向量
         self.latent_image_embedding = ImagePositionalEmbeddings(
-            num_embed=self.config.num_vector_embeds, embed_dim=self.inner_dim, height=self.height, width=self.width
+            num_embed=self.config.num_vector_embeds, 
+            embed_dim=self.inner_dim, # codebook大小，如1024
+            height=self.height,       # 潜在空间高度，如32
+            width=self.width          # 潜在空间宽度，如32
         )
 
         self.transformer_blocks = nn.ModuleList(
@@ -378,6 +439,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
         """
         if cross_attention_kwargs is not None:
             if cross_attention_kwargs.get("scale", None) is not None:
+                # 交叉注意力条件的scale参数已弃用
                 logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
         # ensure attention_mask is a bias, and give it a singleton query_tokens dimension.
         #   we may have done this conversion already, e.g. if we came here via UNet2DConditionModel#forward.
@@ -390,6 +452,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
         #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
         #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
         if attention_mask is not None and attention_mask.ndim == 2:
+            # 处理自注意力掩码，掩码的值是0或1
             # assume that mask is expressed as:
             #   (1 = keep,      0 = discard)
             # convert mask into a bias that can be added to attention scores:
@@ -399,17 +462,22 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
 
         # convert encoder_attention_mask to a bias the same way we do for attention_mask
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+            # 处理交叉注意力掩码，与上面类似
             encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
+        # 处理输入，经过处理后可以直接送入Transformer块
         # 1. Input
         if self.is_input_continuous:
+            # 连续图像
             batch_size, _, height, width = hidden_states.shape
             residual = hidden_states
             hidden_states, inner_dim = self._operate_on_continuous_inputs(hidden_states)
         elif self.is_input_vectorized:
+            # 向量化离散图像
             hidden_states = self.latent_image_embedding(hidden_states)
         elif self.is_input_patches:
+            # 分块图像
             height, width = hidden_states.shape[-2] // self.patch_size, hidden_states.shape[-1] // self.patch_size
             hidden_states, encoder_hidden_states, timestep, embedded_timestep = self._operate_on_patched_inputs(
                 hidden_states, encoder_hidden_states, timestep, added_cond_kwargs
@@ -467,14 +535,21 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
         return Transformer2DModelOutput(sample=output)
 
     def _operate_on_continuous_inputs(self, hidden_states):
+        # 处理连续图像的输入，shape: (batch, channels, height, width)
         batch, _, height, width = hidden_states.shape
+
+        # 归一化
         hidden_states = self.norm(hidden_states)
 
         if not self.use_linear_projection:
+            # 使用卷积层进行输入投影
             hidden_states = self.proj_in(hidden_states)
             inner_dim = hidden_states.shape[1]
+
+            # 转换成 Transformer 需要的形状 (batch, height * width, inner_dim)
             hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
         else:
+            # 使用线性层进行输入投影
             inner_dim = hidden_states.shape[1]
             hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
             hidden_states = self.proj_in(hidden_states)

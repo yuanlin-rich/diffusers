@@ -749,6 +749,7 @@ class UNetMidBlock2D(nn.Module):
 
 
 class UNetMidBlock2DCrossAttn(nn.Module):
+    # unets的中间层结构reset + (attention + reset + attention + reset ...)
     def __init__(
         self,
         in_channels: int,
@@ -773,15 +774,22 @@ class UNetMidBlock2DCrossAttn(nn.Module):
     ):
         super().__init__()
 
+        # 如果out_channels没有指定，就等于in_channels
         out_channels = out_channels or in_channels
         self.in_channels = in_channels
         self.out_channels = out_channels
 
+        # 是否开启交叉注意力
         self.has_cross_attention = True
+
+        # 交叉注意力头的数量
         self.num_attention_heads = num_attention_heads
+
+        # resnet组的数量
         resnet_groups = resnet_groups if resnet_groups is not None else min(in_channels // 4, 32)
 
         # support for variable transformer layers per block
+        # 支持设置每个block的transformer层数
         if isinstance(transformer_layers_per_block, int):
             transformer_layers_per_block = [transformer_layers_per_block] * num_layers
 
@@ -805,6 +813,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         ]
         attentions = []
 
+        # 共有num_layers个attention + resnet块
         for i in range(num_layers):
             if not dual_cross_attention:
                 attentions.append(
@@ -864,7 +873,10 @@ class UNetMidBlock2DCrossAttn(nn.Module):
             if cross_attention_kwargs.get("scale", None) is not None:
                 logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
 
+        # 输入的hidden_states先经过第一个resnet块
         hidden_states = self.resnets[0](hidden_states, temb)
+
+        # 然后依次经过attention和resnet块
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = attn(
@@ -887,6 +899,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                 )[0]
                 hidden_states = resnet(hidden_states, temb)
 
+        # 中间层的输出
         return hidden_states
 
 

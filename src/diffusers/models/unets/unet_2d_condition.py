@@ -261,12 +261,15 @@ class UNet2DConditionModel(
             num_attention_heads=num_attention_heads,
         )
 
+        # 输入是带有噪声的图像或者latent空间表示
+        # 经过卷积，增加通道数量，并且为了保持图像尺寸不变，进行了padding
         # input
         conv_in_padding = (conv_in_kernel - 1) // 2
         self.conv_in = nn.Conv2d(
             in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
         )
 
+        # 时间嵌入
         # time
         time_embed_dim, timestep_input_dim = self._set_time_proj(
             time_embedding_type,
@@ -290,6 +293,7 @@ class UNet2DConditionModel(
             encoder_hid_dim=encoder_hid_dim,
         )
 
+        # 类别潜入
         # class embedding
         self._set_class_embedding(
             class_embed_type,
@@ -317,33 +321,49 @@ class UNet2DConditionModel(
         else:
             self.time_embed_act = get_activation(time_embedding_act_fn)
 
+        # 降采样层
         self.down_blocks = nn.ModuleList([])
+
+        # 升采样层
         self.up_blocks = nn.ModuleList([])
 
+        # unets中有多个上采样块和下采样块，每个块都可能包含多个resnet和attention子块
+        # 可以有不同的配置
         if isinstance(only_cross_attention, bool):
+            # 如果用户传入了一个布尔值（而不是列表/元组）
             if mid_block_only_cross_attention is None:
+                # 如果用户没有显式指定中间块的only_cross_attention
+                # 则让中间块使用与下采样块相同的设置
                 mid_block_only_cross_attention = only_cross_attention
 
+            # 将单个布尔值扩展为列表，长度等于下采样块的数量
             only_cross_attention = [only_cross_attention] * len(down_block_types)
 
         if mid_block_only_cross_attention is None:
+            # 如果没有指定，默认中间块不使用only_cross_attention
             mid_block_only_cross_attention = False
 
         if isinstance(num_attention_heads, int):
+            # 将整数扩展为元组
             num_attention_heads = (num_attention_heads,) * len(down_block_types)
 
         if isinstance(attention_head_dim, int):
+            # 将整数扩展为元组
             attention_head_dim = (attention_head_dim,) * len(down_block_types)
 
         if isinstance(cross_attention_dim, int):
+            # 将整数扩展为元组
             cross_attention_dim = (cross_attention_dim,) * len(down_block_types)
 
         if isinstance(layers_per_block, int):
+            # 将整数扩展为列表
             layers_per_block = [layers_per_block] * len(down_block_types)
 
         if isinstance(transformer_layers_per_block, int):
+            # 将整数扩展为列表
             transformer_layers_per_block = [transformer_layers_per_block] * len(down_block_types)
 
+        # 时间嵌入和类别嵌入是相加还是拼接
         if class_embeddings_concat:
             # The time embeddings are concatenated with the class embeddings. The dimension of the
             # time embeddings passed to the down, middle, and up blocks is twice the dimension of the
@@ -352,6 +372,7 @@ class UNet2DConditionModel(
         else:
             blocks_time_embed_dim = time_embed_dim
 
+        # 降采样层
         # down
         output_channel = block_out_channels[0]
         for i, down_block_type in enumerate(down_block_types):
@@ -387,6 +408,7 @@ class UNet2DConditionModel(
             )
             self.down_blocks.append(down_block)
 
+        # 中间层，看起来只有一层
         # mid
         self.mid_block = get_mid_block(
             mid_block_type,
@@ -414,6 +436,7 @@ class UNet2DConditionModel(
         # count how many layers upsample the images
         self.num_upsamplers = 0
 
+        # 升采样层，输入输出参数和降采样层相反
         # up
         reversed_block_out_channels = list(reversed(block_out_channels))
         reversed_num_attention_heads = list(reversed(num_attention_heads))
@@ -470,6 +493,7 @@ class UNet2DConditionModel(
             )
             self.up_blocks.append(up_block)
 
+        # 输出，经过GroupNorm和激活函数处理
         # out
         if norm_num_groups is not None:
             self.conv_norm_out = nn.GroupNorm(
@@ -482,6 +506,7 @@ class UNet2DConditionModel(
             self.conv_norm_out = None
             self.conv_act = None
 
+        # 卷积，恢复原来的channels数量
         conv_out_padding = (conv_out_kernel - 1) // 2
         self.conv_out = nn.Conv2d(
             block_out_channels[0], out_channels, kernel_size=conv_out_kernel, padding=conv_out_padding

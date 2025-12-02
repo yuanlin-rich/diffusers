@@ -1185,6 +1185,8 @@ class CrossAttnDownBlock2D(nn.Module):
             transformer_layers_per_block = [transformer_layers_per_block] * num_layers
 
         # 共有多少层，每层都是有resent和transformer组成，默认只有一层
+        # 只有第一层的输入输出是in_channels到out_channels
+        # 后续层的输入输出都是out_channels到out_channels
         for i in range(num_layers):
             in_channels = in_channels if i == 0 else out_channels
             resnets.append(
@@ -1268,6 +1270,7 @@ class CrossAttnDownBlock2D(nn.Module):
         for i, (resnet, attn) in enumerate(blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 # 是否开启了梯度计算以及梯度点检查
+                # 先resnet再transformer
                 hidden_states = self._gradient_checkpointing_func(resnet, hidden_states, temb)
                 hidden_states = attn(
                     hidden_states,

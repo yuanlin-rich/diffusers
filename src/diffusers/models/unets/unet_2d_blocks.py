@@ -1311,6 +1311,7 @@ class CrossAttnDownBlock2D(nn.Module):
 
 
 class DownBlock2D(nn.Module):
+    # unet网络的降采样模块，多层resnet+最后一层降采样层组成
     def __init__(
         self,
         in_channels: int,
@@ -1329,14 +1330,15 @@ class DownBlock2D(nn.Module):
     ):
         super().__init__()
         resnets = []
-
         for i in range(num_layers):
+            # 只有第一层的输入输出是in_channels到out_channels
+            # 后续层的输入输出都是out_channels到out_channels
             in_channels = in_channels if i == 0 else out_channels
             resnets.append(
                 ResnetBlock2D(
                     in_channels=in_channels,
                     out_channels=out_channels,
-                    temb_channels=temb_channels,
+                    temb_channels=temb_channels,                        # 时间嵌入，用于注入时间信息
                     eps=resnet_eps,
                     groups=resnet_groups,
                     dropout=dropout,
@@ -1365,6 +1367,7 @@ class DownBlock2D(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None, *args, **kwargs
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        # 处理过时的scale参数
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
             deprecate("scale", "1.0.0", deprecation_message)
@@ -1385,6 +1388,7 @@ class DownBlock2D(nn.Module):
 
             output_states = output_states + (hidden_states,)
 
+        # 返回整个模块的输出以及每一层的输出，每一层的属于用于unet中的 skip connection
         return hidden_states, output_states
 
 

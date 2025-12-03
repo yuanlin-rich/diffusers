@@ -69,6 +69,8 @@ def betas_for_alpha_bar(
         `torch.Tensor`:
             The betas used by the scheduler to step the model outputs.
     """
+    # 实现了余弦调度（cosine schedule） 和指数调度（exp schedule），这是DDPM中两种非常流行的噪声调度方式
+    # 从累积乘积 ᾱ(t) 的函数形式出发，反推出离散的 β_t
     if alpha_transform_type == "cosine":
 
         def alpha_bar_fn(t):
@@ -103,6 +105,7 @@ def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
         `torch.Tensor`:
             Rescaled betas with zero terminal SNR.
     """
+    # 这个函数通过调整 betas，使得终端 SNR 为零，从而改善扩散模型的生成效果。但是，需要小心检查调整后的 beta 值是否有效
     # Convert betas to alphas_bar_sqrt
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -197,6 +200,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         steps_offset: int = 0,
         rescale_betas_zero_snr: bool = False,
     ):
+        # 每个时间步添加的噪声的方差
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
         elif beta_schedule == "linear":
@@ -270,6 +274,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
                 `num_inference_steps` must be `None`.
 
         """
+        # 设置采样哪些时间步数
         if num_inference_steps is not None and timesteps is not None:
             raise ValueError("Can only pass one of `num_inference_steps` or `custom_timesteps`.")
 
@@ -348,6 +353,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             `torch.Tensor`:
                 The computed variance.
         """
+        # 给出给定步数t的方差
         prev_t = self.previous_timestep(t)
 
         alpha_prod_t = self.alphas_cumprod[t]
@@ -459,6 +465,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
                 If return_dict is `True`, [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] is returned, otherwise a
                 tuple is returned where the first element is the sample tensor.
         """
+        # 去噪声过程
         t = timestep
 
         prev_t = self.previous_timestep(t)
@@ -557,6 +564,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
         # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
         # for the subsequent add_noise calls
+        # 加噪声过程
         self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
         alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
         timesteps = timesteps.to(original_samples.device)

@@ -46,6 +46,10 @@ class BaseOutput(OrderedDict):
     > [!WARNING] > You can't unpack a [`BaseOutput`] directly. Use the [`~utils.BaseOutput.to_tuple`] method to convert
     it to a tuple > first.
     """
+    # 继承自OrderedDict，提供了三种访问的方式
+    # 1）类属性的访问方式
+    # 2）字典的访问方式
+    # 3）元组的访问方式
 
     def __init_subclass__(cls) -> None:
         """Register subclasses as pytree nodes.
@@ -55,6 +59,7 @@ class BaseOutput(OrderedDict):
         """
         if is_torch_available():
             import torch.utils._pytree
+            # 将自定义类型注册为pytree节点。这允许pytorch对该类型的实例进行flattenunflatten操作
 
             if is_torch_version("<", "2.2"):
                 torch.utils._pytree._register_pytree_node(
@@ -71,6 +76,7 @@ class BaseOutput(OrderedDict):
                 )
 
     def __post_init__(self) -> None:
+        # 获取数据类（dataclass）的所有字段
         class_fields = fields(self)
 
         # Safety and consistency checks

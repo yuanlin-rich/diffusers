@@ -89,6 +89,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             conditioning with `class_embed_type` equal to `None`.
     """
 
+    # 梯度检查，可以减少内存占用
     _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = ["norm"]
 

@@ -128,6 +128,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         super().__init__()
 
         self.sample_size = sample_size
+        # 时间嵌入的维度，如果未指定，则使用block_out_channels[0] * 4
         time_embed_dim = time_embedding_dim or block_out_channels[0] * 4
 
         # Check inputs
@@ -142,9 +143,11 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             )
 
         # input
+        # 通过卷积层，将输入维度从in_channels转为block_out_channels[0]
         self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
 
         # time
+        # 时间投影，输入维度timestep_input_dim，输出维度time_embed_dim
         if time_embedding_type == "fourier":
             self.time_proj = GaussianFourierProjection(embedding_size=block_out_channels[0], scale=16)
             timestep_input_dim = 2 * block_out_channels[0]
@@ -155,9 +158,11 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             self.time_proj = nn.Embedding(num_train_timesteps, block_out_channels[0])
             timestep_input_dim = block_out_channels[0]
 
+        # 时间嵌入
         self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
 
-        # class embedding
+        # class embedding，输入维度可能有多种，输出维度time_embed_dim
+        # 类别嵌入
         if class_embed_type is None and num_class_embeds is not None:
             self.class_embedding = nn.Embedding(num_class_embeds, time_embed_dim)
         elif class_embed_type == "timestep":
@@ -167,14 +172,23 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         else:
             self.class_embedding = None
 
+        # 降采样blocks
         self.down_blocks = nn.ModuleList([])
+
+        # 中间层blocks
         self.mid_block = None
+
+        # 升采样的blocks
         self.up_blocks = nn.ModuleList([])
 
         # down
+        # 降采样模块，block_out_channels代表每个blocks输出通道数
         output_channel = block_out_channels[0]
         for i, down_block_type in enumerate(down_block_types):
+            # 当前block的输入通道数就是上个block的输出通道数量
             input_channel = output_channel
+            
+            # 当前block的输出通道数量由block_out_channels指定
             output_channel = block_out_channels[i]
             is_final_block = i == len(block_out_channels) - 1
 
@@ -184,7 +198,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 in_channels=input_channel,
                 out_channels=output_channel,
                 temb_channels=time_embed_dim,
-                add_downsample=not is_final_block,
+                add_downsample=not is_final_block, # 只有最后一个block，才添加降采样模块
                 resnet_eps=norm_eps,
                 resnet_act_fn=act_fn,
                 resnet_groups=norm_num_groups,
@@ -201,7 +215,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             self.mid_block = None
         else:
             self.mid_block = UNetMidBlock2D(
-                in_channels=block_out_channels[-1],
+                in_channels=block_out_channels[-1], # 中间层的输入通道数量，就是最后一层降采样block的输出通道数量
                 temb_channels=time_embed_dim,
                 dropout=dropout,
                 resnet_eps=norm_eps,
@@ -215,7 +229,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             )
 
         # up
-        reversed_block_out_channels = list(reversed(block_out_channels))
+        reversed_block_out_channels = list(reversed(block_out_channels)) # 升采样的输出通道数，和降采样的输出通道数你序
         output_channel = reversed_block_out_channels[0]
         for i, up_block_type in enumerate(up_block_types):
             prev_output_channel = output_channel
@@ -231,7 +245,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 out_channels=output_channel,
                 prev_output_channel=prev_output_channel,
                 temb_channels=time_embed_dim,
-                add_upsample=not is_final_block,
+                add_upsample=not is_final_block, # 如果是最后一层升采样block，最升采样
                 resnet_eps=norm_eps,
                 resnet_act_fn=act_fn,
                 resnet_groups=norm_num_groups,
@@ -244,14 +258,20 @@ class UNet2DModel(ModelMixin, ConfigMixin):
 
         # out
         num_groups_out = norm_num_groups if norm_num_groups is not None else min(block_out_channels[0] // 4, 32)
+
+        # 输出做GroupNorm
         self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=num_groups_out, eps=norm_eps)
+
+        # 然后做激活函数
         self.conv_act = nn.SiLU()
+
+        # 通过卷积，将通道数量转为out_channels
         self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 
     def forward(
         self,
         sample: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
+        timestep: Union[torch.Tensor, float, int],   # 时间嵌入可以是tensor，float，int中的任意一种类型
         class_labels: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[UNet2DOutput, Tuple]:
@@ -273,19 +293,24 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 returned where the first element is the sample tensor.
         """
         # 0. center input if necessary
+        # 把样本的均值中心化
         if self.config.center_input_sample:
             sample = 2 * sample - 1.0
 
         # 1. time
+        # 确保timesteps始终是形状为[1]的整数张量，与sample在相同设备上
         timesteps = timestep
         if not torch.is_tensor(timesteps):
             timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            # 处理0维张量
             timesteps = timesteps[None].to(sample.device)
 
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        # 将timesteps广播为batch的size
         timesteps = timesteps * torch.ones(sample.shape[0], dtype=timesteps.dtype, device=timesteps.device)
 
+        # 处理时间信息，经过self.time_proj和self.time_embedding的计算
         t_emb = self.time_proj(timesteps)
 
         # timesteps does not contain any weights and will always return f32 tensors
@@ -294,26 +319,37 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         t_emb = t_emb.to(dtype=self.dtype)
         emb = self.time_embedding(t_emb)
 
+        # 处理类别信息
         if self.class_embedding is not None:
             if class_labels is None:
+                # 如果初始化的时候指定了需要类别信息但是forward的时候没有提供类别信息，则报错
                 raise ValueError("class_labels should be provided when doing class conditioning")
 
             if self.config.class_embed_type == "timestep":
+                # 如果类别的嵌入类型是timestep，则用time_proj处理
                 class_labels = self.time_proj(class_labels)
 
+            # 类别信息
             class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
+
+            # 嵌入信息同时包含时间信息 + 类别信息
             emb = emb + class_emb
         elif self.class_embedding is None and class_labels is not None:
+            # 如果初始化的时候没有指定需要类别信息但是forward的时候提供类别信息，则发出警告
             raise ValueError("class_embedding needs to be initialized in order to use class conditioning")
 
         # 2. pre-process
+        # 预处理，通过卷积层将输入的通道数专为和第一层download block层的输入的通道数一致
         skip_sample = sample
         sample = self.conv_in(sample)
 
         # 3. down
+        # 降采样，注意如何做skip connection
         down_block_res_samples = (sample,)
         for downsample_block in self.down_blocks:
             if hasattr(downsample_block, "skip_conv"):
+                # 降采样block是否包含skip_conv的属性
+                # 暂时不深入研究了，看起来skip_conv像是是否对skip做卷积操作
                 sample, res_samples, skip_sample = downsample_block(
                     hidden_states=sample, temb=emb, skip_sample=skip_sample
                 )
@@ -323,10 +359,12 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             down_block_res_samples += res_samples
 
         # 4. mid
+        # 中间层
         if self.mid_block is not None:
             sample = self.mid_block(sample, emb)
 
         # 5. up
+        # 升采样
         skip_sample = None
         for upsample_block in self.up_blocks:
             res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
@@ -338,6 +376,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 sample = upsample_block(sample, res_samples, emb)
 
         # 6. post-process
+        # 后处理操作，卷积，激活函数等
         sample = self.conv_norm_out(sample)
         sample = self.conv_act(sample)
         sample = self.conv_out(sample)

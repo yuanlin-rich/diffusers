@@ -1029,6 +1029,7 @@ class UNetMidBlock2DSimpleCrossAttn(nn.Module):
 
 
 class AttnDownBlock2D(nn.Module):
+    # unet使用的降采样模块，包含注意力机制
     def __init__(
         self,
         in_channels: int,
@@ -1052,13 +1053,19 @@ class AttnDownBlock2D(nn.Module):
         self.downsample_type = downsample_type
 
         if attention_head_dim is None:
+            # 不建议将交叉注意力头数的维度设置为None
             logger.warning(
                 f"It is not recommend to pass `attention_head_dim=None`. Defaulting `attention_head_dim` to `in_channels`: {out_channels}."
             )
+
+            # 如果attention_head_dim维度为None，则将他设置为out_channels
             attention_head_dim = out_channels
 
         for i in range(num_layers):
+            # 只有第一层的输入是维度是in_channels，否则输入都是out_channels
+            # 也就是说只有第一层的channels会发生变化
             in_channels = in_channels if i == 0 else out_channels
+            # 每一层都由resnet和attention组成
             resnets.append(
                 ResnetBlock2D(
                     in_channels=in_channels,
@@ -1088,10 +1095,12 @@ class AttnDownBlock2D(nn.Module):
                 )
             )
 
+        # 放到nn.ModuleList中，才能参与梯度下降
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
         if downsample_type == "conv":
+            # 使用卷积的方式做降采样
             self.downsamplers = nn.ModuleList(
                 [
                     Downsample2D(
@@ -1100,6 +1109,7 @@ class AttnDownBlock2D(nn.Module):
                 ]
             )
         elif downsample_type == "resnet":
+            # 使用resnet的方式做降采样
             self.downsamplers = nn.ModuleList(
                 [
                     ResnetBlock2D(
@@ -1118,6 +1128,7 @@ class AttnDownBlock2D(nn.Module):
                 ]
             )
         else:
+            # 不做降采样
             self.downsamplers = None
 
         self.gradient_checkpointing = False
@@ -1131,12 +1142,15 @@ class AttnDownBlock2D(nn.Module):
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
         if cross_attention_kwargs.get("scale", None) is not None:
+            # 如果交叉注意力的参数重包含scale，发出警告，并且scale不会被使用
             logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
 
         output_states = ()
 
         for resnet, attn in zip(self.resnets, self.attentions):
+            # 还是保留整体的输出，以及每一层的输出用于做skip connection
             if torch.is_grad_enabled() and self.gradient_checkpointing:
+                # 开启梯度检查
                 hidden_states = self._gradient_checkpointing_func(resnet, hidden_states, temb)
                 hidden_states = attn(hidden_states, **cross_attention_kwargs)
                 output_states = output_states + (hidden_states,)
@@ -1324,12 +1338,12 @@ class CrossAttnDownBlock2D(nn.Module):
 
 
 class DownBlock2D(nn.Module):
-    # unet网络的降采样模块，多层resnet+最后一层降采样层组成
+    # 降采样block，多层resnet + 最后一层降采样
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        temb_channels: int,
+        temb_channels: int,                         # 嵌入信息通道
         dropout: float = 0.0,
         num_layers: int = 1,
         resnet_eps: float = 1e-6,
@@ -1365,6 +1379,7 @@ class DownBlock2D(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
         if add_downsample:
+            # 是否在最后一步做降采样
             self.downsamplers = nn.ModuleList(
                 [
                     Downsample2D(
@@ -1380,30 +1395,33 @@ class DownBlock2D(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None, *args, **kwargs
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        # 处理过时的scale参数
         if len(args) > 0 or kwargs.get("scale", None) is not None:
+            # 如果输入的参数重包含scale，发出警告，scale参数过时，并且不会被使用
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
             deprecate("scale", "1.0.0", deprecation_message)
 
+        # DownBlock2D的输出
         output_states = ()
 
         for resnet in self.resnets:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
+                # 梯度检查，能节省内存使用
                 hidden_states = self._gradient_checkpointing_func(resnet, hidden_states, temb)
             else:
                 hidden_states = resnet(hidden_states, temb)
 
+            # 保留了每一层resnet的输出
             output_states = output_states + (hidden_states,)
 
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
+                # 如果有降采样模块，对最后一层resnet的输出做降采样
                 hidden_states = downsampler(hidden_states)
 
             output_states = output_states + (hidden_states,)
 
-        # 返回整个模块的输出以及每一层的输出，每一层的属于用于unet中的 skip connection
+        # 整个模块的输出，以及每一层resnet或者downsampler的输出，每一层的输出做skip connection
         return hidden_states, output_states
-
 
 class DownEncoderBlock2D(nn.Module):
     def __init__(

@@ -2544,6 +2544,7 @@ class CrossAttnUpBlock2D(nn.Module):
 
 
 class UpBlock2D(nn.Module):
+    # 升采样层
     def __init__(
         self,
         in_channels: int,

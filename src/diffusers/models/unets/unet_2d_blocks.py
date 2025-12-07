@@ -616,6 +616,7 @@ class UNetMidBlock2D(nn.Module):
         height, width)`.
 
     """
+    # unet_2d网络的中间层
 
     def __init__(
         self,
@@ -2237,6 +2238,7 @@ class KCrossAttnDownBlock2D(nn.Module):
 
 
 class AttnUpBlock2D(nn.Module):
+    # unet2d网络的上采样模块
     def __init__(
         self,
         in_channels: int,

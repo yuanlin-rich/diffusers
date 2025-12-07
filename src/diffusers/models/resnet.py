@@ -216,6 +216,7 @@ class ResnetBlock2D(nn.Module):
         conv_2d_out_channels (`int`, *optional*, default to `None`): the number of channels in the output.
             If None, same as `out_channels`.
     """
+    # 残差网络，输出x + resnet(x)
 
     def __init__(
         self,
@@ -241,6 +242,7 @@ class ResnetBlock2D(nn.Module):
         conv_2d_out_channels: Optional[int] = None,
     ):
         super().__init__()
+        # 时间嵌入层的归一化方式，ResnetBlock2D不支持ada_group和spatial两种归一化方式
         if time_embedding_norm == "ada_group":
             raise ValueError(
                 "This class cannot be used with `time_embedding_norm==ada_group`, please use `ResnetBlockCondNorm2D` instead",
@@ -257,7 +259,11 @@ class ResnetBlock2D(nn.Module):
         self.use_conv_shortcut = conv_shortcut
         self.up = up
         self.down = down
+
+        # 输出缩放比例
         self.output_scale_factor = output_scale_factor
+
+        # 时间嵌入的归一化方式
         self.time_embedding_norm = time_embedding_norm
         self.skip_time_act = skip_time_act
 
@@ -266,12 +272,16 @@ class ResnetBlock2D(nn.Module):
 
         self.norm1 = torch.nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True)
 
+        # 卷积层，将输入通道数专为输出通道数量
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
         if temb_channels is not None:
+            # 嵌入层的通道数
             if self.time_embedding_norm == "default":
+                # 默认使用nn.Linar，通道数从temb_channels专为out_channels
                 self.time_emb_proj = nn.Linear(temb_channels, out_channels)
             elif self.time_embedding_norm == "scale_shift":
+                # scale_shift使用nn.Linar，通道数从temb_channels专为2 * out_channels
                 self.time_emb_proj = nn.Linear(temb_channels, 2 * out_channels)
             else:
                 raise ValueError(f"unknown time_embedding_norm : {self.time_embedding_norm} ")
@@ -284,10 +294,12 @@ class ResnetBlock2D(nn.Module):
         conv_2d_out_channels = conv_2d_out_channels or out_channels
         self.conv2 = nn.Conv2d(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
 
+        # 激活函数
         self.nonlinearity = get_activation(non_linearity)
 
         self.upsample = self.downsample = None
         if self.up:
+            # 如果做上采样
             if kernel == "fir":
                 fir_kernel = (1, 3, 3, 1)
                 self.upsample = lambda x: upsample_2d(x, kernel=fir_kernel)
@@ -296,6 +308,7 @@ class ResnetBlock2D(nn.Module):
             else:
                 self.upsample = Upsample2D(in_channels, use_conv=False)
         elif self.down:
+            # 如果做下采样
             if kernel == "fir":
                 fir_kernel = (1, 3, 3, 1)
                 self.downsample = lambda x: downsample_2d(x, kernel=fir_kernel)
@@ -324,27 +337,35 @@ class ResnetBlock2D(nn.Module):
 
         hidden_states = input_tensor
 
+        # 归一化
         hidden_states = self.norm1(hidden_states)
+
+        # 激活函数
         hidden_states = self.nonlinearity(hidden_states)
 
         if self.upsample is not None:
             # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
+            # 上采样处理
             if hidden_states.shape[0] >= 64:
                 input_tensor = input_tensor.contiguous()
                 hidden_states = hidden_states.contiguous()
             input_tensor = self.upsample(input_tensor)
             hidden_states = self.upsample(hidden_states)
         elif self.downsample is not None:
+            # 下采样处理
             input_tensor = self.downsample(input_tensor)
             hidden_states = self.downsample(hidden_states)
 
+        # 卷积
         hidden_states = self.conv1(hidden_states)
 
+        # 处理嵌入信息
         if self.time_emb_proj is not None:
             if not self.skip_time_act:
                 temb = self.nonlinearity(temb)
             temb = self.time_emb_proj(temb)[:, :, None, None]
 
+        # 几种将嵌入信息和hidden_states融合的方式
         if self.time_embedding_norm == "default":
             if temb is not None:
                 hidden_states = hidden_states + temb
@@ -360,16 +381,21 @@ class ResnetBlock2D(nn.Module):
         else:
             hidden_states = self.norm2(hidden_states)
 
+        # 激活函数
         hidden_states = self.nonlinearity(hidden_states)
 
+        # dropout
         hidden_states = self.dropout(hidden_states)
+
+        # 卷积
         hidden_states = self.conv2(hidden_states)
 
+        # 这个不知道是什么
         if self.conv_shortcut is not None:
             input_tensor = self.conv_shortcut(input_tensor.contiguous())
 
+        # 残差在这里，(x + f(x)) / scale
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
-
         return output_tensor
 
 

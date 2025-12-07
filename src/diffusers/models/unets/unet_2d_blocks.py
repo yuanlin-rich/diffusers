@@ -2264,15 +2264,20 @@ class AttnUpBlock2D(nn.Module):
         self.upsample_type = upsample_type
 
         if attention_head_dim is None:
+            # 如果没有指定attention_head_dim，发出警告，设置attention_head_dim为out_channels
             logger.warning(
                 f"It is not recommend to pass `attention_head_dim=None`. Defaulting `attention_head_dim` to `in_channels`: {out_channels}."
             )
             attention_head_dim = out_channels
 
         for i in range(num_layers):
+            # skip connection的通道数
             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+
+            # 输入的通道数
             resnet_in_channels = prev_output_channel if i == 0 else out_channels
 
+            # resnet
             resnets.append(
                 ResnetBlock2D(
                     in_channels=resnet_in_channels + res_skip_channels,
@@ -2287,6 +2292,8 @@ class AttnUpBlock2D(nn.Module):
                     pre_norm=resnet_pre_norm,
                 )
             )
+
+            # attention
             attentions.append(
                 Attention(
                     out_channels,
@@ -2302,12 +2309,16 @@ class AttnUpBlock2D(nn.Module):
                 )
             )
 
+        # 添加进nn.ModuleList才能参与训练
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
+        # 上采样类型
         if upsample_type == "conv":
+            # 使用Upsample2D上采样
             self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
         elif upsample_type == "resnet":
+            # 使用ResnetBlock2D上采样
             self.upsamplers = nn.ModuleList(
                 [
                     ResnetBlock2D(
@@ -2341,13 +2352,18 @@ class AttnUpBlock2D(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
+            # scale参数已经被废弃，不会使用
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
             deprecate("scale", "1.0.0", deprecation_message)
 
         for resnet, attn in zip(self.resnets, self.attentions):
             # pop res hidden states
+            # res_hidden_states是整个降采样blocks的输出
+            # res_hidden_states_tuple是每个降采样block的输出，用于做skip connection
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+
+            # 将res_hidden_states和res_hidden_states_tuple拼接
             hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
 
             if torch.is_grad_enabled() and self.gradient_checkpointing:

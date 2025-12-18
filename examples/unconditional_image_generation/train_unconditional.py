@@ -1,3 +1,6 @@
+# 完整的ddpm训练脚本，支持从头开始训练一个unet模型用于无条件图像生成。
+# 务必开启混合精度，节省显存提升速度！！！
+
 import argparse
 import inspect
 import logging
@@ -44,11 +47,19 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
                             dimension equal to the length of timesteps.
     :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
     """
+    # 从1维数组arr中提取对应timesteps索引的值，并扩展到指定的广播形状。
+    # arr: 1维数组，通常是预计算的噪声调度参数（如α_t、β_t等）
+    # timesteps: 批次中每个样本对应的时间步索引张量
+    # broadcast_shape: 目标广播形状，用于后续计算
     if not isinstance(arr, torch.Tensor):
         arr = torch.from_numpy(arr)
     res = arr[timesteps].float().to(timesteps.device)
+
+    # 让arr的形状匹配broadcast_shape
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
+    
+    # expand创建一个新的视图，而不复制数据
     return res.expand(broadcast_shape)
 
 
@@ -56,12 +67,15 @@ def _ensure_three_channels(tensor: torch.Tensor) -> torch.Tensor:
     """
     Ensure the tensor has exactly three channels (C, H, W) by repeating or truncating channels when needed.
     """
+    # 确保图像是channels是3
     if tensor.ndim == 2:
+        # 插入新的维度
         tensor = tensor.unsqueeze(0)
     channels = tensor.shape[0]
     if channels == 3:
         return tensor
     if channels == 1:
+        # repeat复制数据
         return tensor.repeat(3, 1, 1)
     if channels == 2:
         return torch.cat([tensor, tensor[:1]], dim=0)
@@ -72,6 +86,8 @@ def _ensure_three_channels(tensor: torch.Tensor) -> torch.Tensor:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+
+    # 数据集名
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -82,18 +98,24 @@ def parse_args():
             " or to a folder containing files that HF Datasets can understand."
         ),
     )
+
+    # 数据集设置
     parser.add_argument(
         "--dataset_config_name",
         type=str,
         default=None,
         help="The config of the Dataset, leave as None if there's only one config.",
     )
+
+    # 模型设置的名字或者路径
     parser.add_argument(
         "--model_config_name_or_path",
         type=str,
         default=None,
         help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
     )
+
+    # 训练集路径
     parser.add_argument(
         "--train_data_dir",
         type=str,
@@ -104,12 +126,16 @@ def parse_args():
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
     )
+
+    # 模型输出路径
     parser.add_argument(
         "--output_dir",
         type=str,
         default="ddpm-model-64",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
+
+    # 输出目录已经存在的时候，是否覆盖
     parser.add_argument("--overwrite_output_dir", action="store_true")
     parser.add_argument(
         "--cache_dir",
@@ -117,6 +143,8 @@ def parse_args():
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
+
+    # 图像分辨率
     parser.add_argument(
         "--resolution",
         type=int,
@@ -126,6 +154,8 @@ def parse_args():
             " resolution"
         ),
     )
+
+    # 中心裁剪还是随机裁剪
     parser.add_argument(
         "--center_crop",
         default=False,
@@ -135,18 +165,26 @@ def parse_args():
             " cropped. The images will be resized to the resolution first before cropping."
         ),
     )
+
+    # 随机水平翻转图像
     parser.add_argument(
         "--random_flip",
         default=False,
         action="store_true",
         help="whether to randomly flip images horizontally",
     )
+
+    # 训练时候的batch size
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
+
+    # 推理时的batch size
     parser.add_argument(
         "--eval_batch_size", type=int, default=16, help="The number of images to generate for evaluation."
     )
+
+    # 加载数据集的进程数量
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -156,23 +194,35 @@ def parse_args():
             " process."
         ),
     )
+
+    # 训练轮次
     parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--save_images_epochs", type=int, default=10, help="How often to save images during training.")
+
+    # 保存图像轮次
+    parser.add_argument("--save_images_epochs", type=int, default = 10, help="How often to save images during training.")
+
+    # 保存模型论词
     parser.add_argument(
         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
     )
+
+    # 梯度累计的步数
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
+
+    # 学习率
     parser.add_argument(
         "--learning_rate",
         type=float,
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
+
+    # 学习率的调度器
     parser.add_argument(
         "--lr_scheduler",
         type=str,
@@ -182,34 +232,55 @@ def parse_args():
             ' "constant", "constant_with_warmup"]'
         ),
     )
+
+    # 控制学习率预热的步数，让学习率从0逐渐增加到目标值，而不是一开始就用全量学习率
     parser.add_argument(
         "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
     )
+
+    # adam优化器的相关参数
+    # adam_beta1：控制学习方向的改变程度，值越大方向越不容易改变
+    # adam_beta2：控制学习率的平滑程度，值越大学习率调整越平滑
+    # adam_weight_decay：控制正则化的程度，值越大，模型越倾向于小的权重
+    # adam_epsilon：贡献模型的稳定性，防止除以0
     parser.add_argument("--adam_beta1", type=float, default=0.95, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument(
         "--adam_weight_decay", type=float, default=1e-6, help="Weight decay magnitude for the Adam optimizer."
     )
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer.")
+
+    # ema相关参数
+    # ema模型总开关
     parser.add_argument(
         "--use_ema",
         action="store_true",
         help="Whether to use Exponential Moving Average for the final model weights.",
     )
+
+    # 控制ema衰减率变化曲线
     parser.add_argument("--ema_inv_gamma", type=float, default=1.0, help="The inverse gamma value for the EMA decay.")
     parser.add_argument("--ema_power", type=float, default=3 / 4, help="The power value for the EMA decay.")
+
+    # ema最终达到的衰减率
     parser.add_argument("--ema_max_decay", type=float, default=0.9999, help="The maximum decay magnitude for EMA.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+
+    # hub的仓库id
     parser.add_argument(
         "--hub_model_id",
         type=str,
         default=None,
         help="The name of the repository to keep in sync with the local `output_dir`.",
     )
+
+    # 是否创建hub的私有仓库
     parser.add_argument(
         "--hub_private_repo", action="store_true", help="Whether or not to create a private repository."
     )
+
+    # 是否使用tensorboard或者wandb记录日志
     parser.add_argument(
         "--logger",
         type=str,
@@ -220,6 +291,8 @@ def parse_args():
             " for experiment tracking and logging of model metrics and model checkpoints"
         ),
     )
+
+    # 日志路径
     parser.add_argument(
         "--logging_dir",
         type=str,
@@ -229,7 +302,11 @@ def parse_args():
             " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
         ),
     )
+
+    # 分布式训练，为每一个gpu分配一个索引
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+
+    # 混合精度，有fp16和bf16两种
     parser.add_argument(
         "--mixed_precision",
         type=str,
@@ -241,6 +318,8 @@ def parse_args():
             "and an Nvidia Ampere GPU."
         ),
     )
+
+    # ddpm预测噪声还是预测原始图像
     parser.add_argument(
         "--prediction_type",
         type=str,
@@ -248,9 +327,17 @@ def parse_args():
         choices=["epsilon", "sample"],
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
+
+    # 扩散步数
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
+
+    # 推理时的去噪步数
     parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
+
+    # beta调度方式
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
+
+    # 多少步设置一次checkpoint，checkpoint用于保存当前训练结果，下次可以继续训练
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -260,12 +347,16 @@ def parse_args():
             " training using `--resume_from_checkpoint`."
         ),
     )
+
+    # 最多有多少个checkpoint
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
         default=None,
         help=("Max number of checkpoints to store."),
     )
+
+    # 是否从checkpoint恢复上一次的训练结果
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
@@ -275,9 +366,13 @@ def parse_args():
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
     )
+
+    # 是否开启xformers
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
+
+    # 是否保持图像的原始位深度（16位/32位），避免强制转换为8位RGB
     parser.add_argument(
         "--preserve_input_precision",
         action="store_true",
@@ -285,6 +380,8 @@ def parse_args():
     )
 
     args = parser.parse_args()
+
+    # 优先使用环境变量的local rank
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -322,10 +419,12 @@ def main(args):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
+                # 只在主进程执行
                 if args.use_ema:
                     ema_model.save_pretrained(os.path.join(output_dir, "unet_ema"))
 
                 for i, model in enumerate(models):
+                    # 重点是保存模型，权重除了pop啥也没干
                     model.save_pretrained(os.path.join(output_dir, "unet"))
 
                     # make sure to pop weight so that corresponding model is not saved again
@@ -359,6 +458,8 @@ def main(args):
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
+
+    # 设置日志级别，主进程日志更详细
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
@@ -406,6 +507,7 @@ def main(args):
         model = UNet2DModel.from_config(config)
 
     # Create EMA for the model.
+    # ema，避免模型的参数剧烈变化
     if args.use_ema:
         ema_model = EMAModel(
             model.parameters(),
@@ -439,14 +541,17 @@ def main(args):
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
     # Initialize the scheduler
+    # 检查当前安装的DDPMScheduler是否支持prediction_type参数
     accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
     if accepts_prediction_type:
+        # 支持prediction_type参数
         noise_scheduler = DDPMScheduler(
             num_train_timesteps=args.ddpm_num_steps,
             beta_schedule=args.ddpm_beta_schedule,
             prediction_type=args.prediction_type,
         )
     else:
+        # 不支持prediction_type参数
         noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
 
     # Initialize the optimizer
@@ -476,6 +581,7 @@ def main(args):
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
     # Preprocessing the datasets and DataLoaders creation.
+    # 精度版本和非精度版本的图像转换
     spatial_augmentations = [
         transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
@@ -485,8 +591,8 @@ def main(args):
     augmentations = transforms.Compose(
         spatial_augmentations
         + [
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.ToTensor(),                  # 转换为tensor，并且缩放到(0, 1)范围内
+            transforms.Normalize([0.5], [0.5]),     # 缩放到(-1, 1)范围内
         ]
     )
 
@@ -524,7 +630,7 @@ def main(args):
         args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=(len(train_dataloader) * args.num_epochs),
+        num_training_steps=(len(train_dataloader) * args.num_epochs),                   # 每次epoch的batch个数 * epoch，就是训练总步数
     )
 
     # Prepare everything with our `accelerator`.
@@ -538,6 +644,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
+        # 主进程中记录训练的日志
         run = os.path.split(__file__)[-1].split(".")[0]
         accelerator.init_trackers(run)
 
@@ -557,6 +664,7 @@ def main(args):
     first_epoch = 0
 
     # Potentially load in the weights and states from a previous save
+    # 从checkpoint恢复
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)

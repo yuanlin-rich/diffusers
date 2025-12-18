@@ -134,6 +134,7 @@ def retrieve_timesteps(
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
+        # scheduler的set_timesteps函数是否支持timesteps作为参数
         accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
         if not accepts_timesteps:
             raise ValueError(
@@ -145,6 +146,7 @@ def retrieve_timesteps(
         num_inference_steps = len(timesteps)
     elif sigmas is not None:
         accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        # scheduler的set_timesteps是否支持sigmas作为参数
         if not accept_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -241,6 +243,7 @@ class StableDiffusionControlNetPipeline(
             )
 
         if isinstance(controlnet, (list, tuple)):
+            # 传入了多个control net
             controlnet = MultiControlNetModel(controlnet)
 
         self.register_modules(

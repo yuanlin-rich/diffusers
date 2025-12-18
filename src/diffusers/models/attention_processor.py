@@ -104,13 +104,13 @@ class Attention(nn.Module):
 
     def __init__(
         self,
-        query_dim: int,
-        cross_attention_dim: Optional[int] = None,
-        heads: int = 8,
-        kv_heads: Optional[int] = None,
-        dim_head: int = 64,
-        dropout: float = 0.0,
-        bias: bool = False,
+        query_dim: int,                                 # 查询维度
+        cross_attention_dim: Optional[int] = None,      # 注意力的维度
+        heads: int = 8,                                 # 注意力头数
+        kv_heads: Optional[int] = None,                 # kv头数
+        dim_head: int = 64,                             # 每个头的维度
+        dropout: float = 0.0,                           # dropout概率
+        bias: bool = False,                             # 是否使用偏移量
         upcast_attention: bool = False,
         upcast_softmax: bool = False,
         cross_attention_norm: Optional[str] = None,
@@ -118,10 +118,10 @@ class Attention(nn.Module):
         qk_norm: Optional[str] = None,
         added_kv_proj_dim: Optional[int] = None,
         added_proj_bias: Optional[bool] = True,
-        norm_num_groups: Optional[int] = None,
+        norm_num_groups: Optional[int] = None,          # group normalize的组数量
         spatial_norm_dim: Optional[int] = None,
         out_bias: bool = True,
-        scale_qk: bool = True,
+        scale_qk: bool = True,                          # 是否缩放qk的计算结果
         only_cross_attention: bool = False,
         eps: float = 1e-5,
         rescale_output_factor: float = 1.0,
@@ -140,11 +140,22 @@ class Attention(nn.Module):
         # To prevent circular import.
         from .normalization import FP32LayerNorm, LpNorm, RMSNorm
 
+        # 内部维度，默认是dim_head * heads，也就是注意力头的维度 * 注意力头的书align，否则是out_dim
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
+
+        # kv的维度，默认和inner_dim相同，如果指定了kv_heads，则是dim_head * kv_heads
         self.inner_kv_dim = self.inner_dim if kv_heads is None else dim_head * kv_heads
+
+        # 查询维度
         self.query_dim = query_dim
+
+        # 是否使用偏移量
         self.use_bias = bias
+
+        # 如果提供了交叉注意力的维度，则是交叉注意力机制，否则是自注意力机制
         self.is_cross_attention = cross_attention_dim is not None
+
+        # 如果自注意力机制，注意力维度和查询维度相同
         self.cross_attention_dim = cross_attention_dim if cross_attention_dim is not None else query_dim
         self.upcast_attention = upcast_attention
         self.upcast_softmax = upcast_softmax
@@ -152,6 +163,8 @@ class Attention(nn.Module):
         self.residual_connection = residual_connection
         self.dropout = dropout
         self.fused_projections = False
+
+        # 输出维度，默认和query_dim相同
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.out_context_dim = out_context_dim if out_context_dim is not None else query_dim
         self.context_pre_only = context_pre_only
@@ -163,7 +176,9 @@ class Attention(nn.Module):
         self._from_deprecated_attn_block = _from_deprecated_attn_block
 
         self.scale_qk = scale_qk
-        self.scale = dim_head**-0.5 if self.scale_qk else 1.0
+
+        # 缩放qk计算结果的比例系数，默认是1 / sqrt(dim_head)
+        self.scale = dim_head ** -0.5 if self.scale_qk else 1.0
 
         self.heads = out_dim // dim_head if out_dim is not None else heads
         # for slice_size > 0 the attention score computation
@@ -189,6 +204,7 @@ class Attention(nn.Module):
         else:
             self.spatial_norm = None
 
+        # 各种归一化qk的方式
         if qk_norm is None:
             self.norm_q = None
             self.norm_k = None
@@ -217,6 +233,7 @@ class Attention(nn.Module):
                 f"unknown qk_norm: {qk_norm}. Should be one of None, 'layer_norm', 'fp32_layer_norm', 'layer_norm_across_heads', 'rms_norm', 'rms_norm_across_heads', 'l2'."
             )
 
+        # 各种归一化交叉注意力的方式
         if cross_attention_norm is None:
             self.norm_cross = None
         elif cross_attention_norm == "layer_norm":
@@ -321,6 +338,7 @@ class Attention(nn.Module):
             partition_spec (`Tuple[]`, *optional*):
                 Specify the partition specification if using SPMD. Otherwise None.
         """
+        # 设置是否使用xla flash版本的注意力实现
         if use_xla_flash_attention:
             if not is_torch_xla_available:
                 raise "torch_xla is not available"
@@ -344,6 +362,7 @@ class Attention(nn.Module):
         Set whether to use npu flash attention from `torch_npu` or not.
 
         """
+        # 设置使用npu版本的注意力实现
         if use_npu_flash_attention:
             processor = AttnProcessorNPU()
         else:
@@ -369,10 +388,15 @@ class Attention(nn.Module):
                 The attention operation to use. Defaults to `None` which uses the default attention operation from
                 `xformers`.
         """
+        # 是否使用xformer版本的内存高利用率的注意力
+
+        # 检测是否是自定义的注意力处理器
         is_custom_diffusion = hasattr(self, "processor") and isinstance(
             self.processor,
             (CustomDiffusionAttnProcessor, CustomDiffusionXFormersAttnProcessor, CustomDiffusionAttnProcessor2_0),
         )
+
+        # 检测是否是添加kv的注意力处理器
         is_added_kv_processor = hasattr(self, "processor") and isinstance(
             self.processor,
             (
@@ -382,10 +406,14 @@ class Attention(nn.Module):
                 XFormersAttnAddedKVProcessor,
             ),
         )
+
+        # 检测是否是ip adapter的注意力处理器
         is_ip_adapter = hasattr(self, "processor") and isinstance(
             self.processor,
             (IPAdapterAttnProcessor, IPAdapterAttnProcessor2_0, IPAdapterXFormersAttnProcessor),
         )
+
+        # 检测是否是联合处理器
         is_joint_processor = hasattr(self, "processor") and isinstance(
             self.processor,
             (
@@ -395,11 +423,14 @@ class Attention(nn.Module):
         )
 
         if use_memory_efficient_attention_xformers:
+            # 使用xformers版本的高内存利用率的处理器
             if is_added_kv_processor and is_custom_diffusion:
+                # xformers不支持同时自定义处理器添加的kv处理器
                 raise NotImplementedError(
                     f"Memory efficient attention is currently not supported for custom diffusion for attention processor type {self.processor}"
                 )
             if not is_xformers_available():
+                # xformers不可用，抛出异常
                 raise ModuleNotFoundError(
                     (
                         "Refer to https://github.com/facebookresearch/xformers for more information on how to install"
@@ -408,6 +439,7 @@ class Attention(nn.Module):
                     name="xformers",
                 )
             elif not torch.cuda.is_available():
+                # cuda不可用，抛出异常
                 raise ValueError(
                     "torch.cuda.is_available() should be True but is False. xformers' memory efficient attention is"
                     " only available for GPU "
@@ -415,6 +447,7 @@ class Attention(nn.Module):
             else:
                 try:
                     # Make sure we can run the memory efficient attention
+                    # 创建张量，检查xformers是否正常运行，不正常运行抛出异常
                     dtype = None
                     if attention_op is not None:
                         op_fw, op_bw = attention_op
@@ -424,6 +457,7 @@ class Attention(nn.Module):
                 except Exception as e:
                     raise e
 
+            # 根据当前处理器类型创建对应的XFormers处理器
             if is_custom_diffusion:
                 processor = CustomDiffusionXFormersAttnProcessor(
                     train_kv=self.processor.train_kv,
@@ -462,6 +496,7 @@ class Attention(nn.Module):
             else:
                 processor = XFormersAttnProcessor(attention_op=attention_op)
         else:
+            # 不使用xformers，创建对应的非xformers版本的处理器
             if is_custom_diffusion:
                 attn_processor_class = (
                     CustomDiffusionAttnProcessor2_0
@@ -545,6 +580,8 @@ class Attention(nn.Module):
             and isinstance(self.processor, torch.nn.Module)
             and not isinstance(processor, torch.nn.Module)
         ):
+            # 旧处理器是nn.Module类型，新处理器不是nn.Modules类型，则需要将旧处理器cong _modules列表移除
+            # 并且对用户发出警告。因为有可能导致训练权重丢失或者性能变化
             logger.info(f"You are removing possibly trained weights of {self.processor} with {processor}")
             self._modules.pop("processor")
 
@@ -591,11 +628,18 @@ class Attention(nn.Module):
         # here we simply pass along all tensors to the selected processor class
         # For standard processors that are defined here, `**cross_attention_kwargs` is empty
 
+        # 使用inspect模块获取processor的__call__方法的参数列表
         attn_parameters = set(inspect.signature(self.processor.__call__).parameters.keys())
+
+        # 这些参数如果不被支持，但是调用方提供了，不会产生警告
         quiet_attn_parameters = {"ip_adapter_masks", "ip_hidden_states"}
+
+        # 找出processor不支持的参数
         unused_kwargs = [
             k for k, _ in cross_attention_kwargs.items() if k not in attn_parameters and k not in quiet_attn_parameters
         ]
+
+        # 存在不支持的参数，发出警告
         if len(unused_kwargs) > 0:
             logger.warning(
                 f"cross_attention_kwargs {unused_kwargs} are not expected by {self.processor.__class__.__name__} and will be ignored."
@@ -668,12 +712,15 @@ class Attention(nn.Module):
         Returns:
             `torch.Tensor`: The attention probabilities/scores.
         """
+        # 计算注意力分数
         dtype = query.dtype
         if self.upcast_attention:
+            # 提升到float32精度
             query = query.float()
             key = key.float()
 
         if attention_mask is None:
+            # 没有掩码：创建一个空的baddbmm_input，beta = 0表示不使用
             baddbmm_input = torch.empty(
                 query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device
             )
@@ -682,21 +729,27 @@ class Attention(nn.Module):
             baddbmm_input = attention_mask
             beta = 1
 
+        # baddbmm公式output = beta * input + alpha * (batch1 @ batch2)
         attention_scores = torch.baddbmm(
             baddbmm_input,
             query,
             key.transpose(-1, -2),
-            beta=beta,
+            beta = beta,
             alpha=self.scale,
         )
         del baddbmm_input
 
         if self.upcast_softmax:
+            # 提升到float32精度
             attention_scores = attention_scores.float()
 
+        # 在最后一个维度应用softmax
+        # 此时维度(batch_size, num_heads, seq_len_q, seq_len_k)
+        # seq_len_q是查询序列的长度，seq_len_k是键序列的长度
         attention_probs = attention_scores.softmax(dim=-1)
         del attention_scores
 
+        # 转回原来的type
         attention_probs = attention_probs.to(dtype)
 
         return attention_probs
@@ -722,10 +775,15 @@ class Attention(nn.Module):
         """
         head_size = self.heads
         if attention_mask is None:
+            # 没有掩码
             return attention_mask
 
         current_length: int = attention_mask.shape[-1]
+
+        # 长度处理
         if current_length != target_length:
+            # 掩码长度小于目标长度，用0填充，0表示这些位置不需要掩码
+            # 长度[B, 1, L_current]，填充后[B, 1, L_target]
             if attention_mask.device.type == "mps":
                 # HACK: MPS: Does not support padding by greater than dimension of input tensor.
                 # Instead, we can manually construct the padding tensor.
@@ -739,12 +797,17 @@ class Attention(nn.Module):
                 # TODO: re-enable tests/models/test_models_unet_2d_condition.py#test_model_xattn_padding
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
 
+        # 维度处理
         if out_dim == 3:
+            # 需要重复掩码以匹配每个注意力头，B是batch size，H是注意力头数
+            # [B, 1, L] -> [B * H, 1, L]
             if attention_mask.shape[0] < batch_size * head_size:
                 attention_mask = attention_mask.repeat_interleave(
                     head_size, dim=0, output_size=attention_mask.shape[0] * head_size
                 )
         elif out_dim == 4:
+            # 增加一个维度，然后重复
+            # [B, 1, L] → unsqueeze(1) → [B, 1, 1, L] → repeat_interleave(H, dim=1) → [B, H, 1, L]
             attention_mask = attention_mask.unsqueeze(1)
             attention_mask = attention_mask.repeat_interleave(
                 head_size, dim=1, output_size=attention_mask.shape[1] * head_size
@@ -763,8 +826,11 @@ class Attention(nn.Module):
         Returns:
             `torch.Tensor`: The normalized encoder hidden states.
         """
+        # 归一化encoder_hidden_states
+        # 没有设置encoder_hidden_states的归一化，调用norm_encoder_hidden_states发出警告
         assert self.norm_cross is not None, "self.norm_cross must be defined to call self.norm_encoder_hidden_states"
 
+        # 只支持LayerNorm和GroupNorm两种类型的归一化
         if isinstance(self.norm_cross, nn.LayerNorm):
             encoder_hidden_states = self.norm_cross(encoder_hidden_states)
         elif isinstance(self.norm_cross, nn.GroupNorm):
@@ -783,6 +849,8 @@ class Attention(nn.Module):
 
     @torch.no_grad()
     def fuse_projections(self, fuse=True):
+        # 投影层融合优化方法，用于在推理时合并多个线性投影层，减少计算量和内存访问，从而提高推理效率
+        # 将原来独立的三个线形变换转换为一个大的线形变换
         device = self.to_q.weight.data.device
         dtype = self.to_q.weight.data.dtype
 
@@ -816,6 +884,7 @@ class Attention(nn.Module):
             and getattr(self, "add_k_proj", None) is not None
             and getattr(self, "add_v_proj", None) is not None
         ):
+            # 对于sd3等模型，还要处理投影层
             concatenated_weights = torch.cat(
                 [self.add_q_proj.weight.data, self.add_k_proj.weight.data, self.add_v_proj.weight.data]
             )
@@ -832,6 +901,7 @@ class Attention(nn.Module):
                 )
                 self.to_added_qkv.bias.copy_(concatenated_bias)
 
+        # 标记已经投影已经融合
         self.fused_projections = fuse
 
 
@@ -2697,12 +2767,13 @@ class AttnProcessor2_0:
     """
 
     def __init__(self):
+        # 检查当前pytorch版本，以及当前pytorch是否提供了F.scaled_dot_product_attention实现
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
         self,
-        attn: Attention,
+        attn: Attention,                                        
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -2711,15 +2782,19 @@ class AttnProcessor2_0:
         **kwargs,
     ) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
+            # 用户提供了废弃的scale参数，则发出警告，并且忽略次参数
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
             deprecate("scale", "1.0.0", deprecation_message)
 
+        # 保存残差连接
         residual = hidden_states
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
 
         input_ndim = hidden_states.ndim
 
+        # 维度处理，如果是4个维度，则拉平成三个维度
+        # 形状（batch_size, channel, height, width）变为(batch_size, height * width, channels)
         if input_ndim == 4:
             batch_size, channel, height, width = hidden_states.shape
             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
@@ -2728,6 +2803,7 @@ class AttnProcessor2_0:
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
 
+        # 注意力掩码
         if attention_mask is not None:
             attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
             # scaled_dot_product_attention expects attention_mask shape to be
@@ -2737,21 +2813,32 @@ class AttnProcessor2_0:
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
+        # 生成query向量，注意此时hidden_states的形状是(batch_size, height * width, channels)
+        # attn.to_q是nn.Linear
+        # query的维度是（batch_size, height * width, attn.inner_dim）
         query = attn.to_q(hidden_states)
 
         if encoder_hidden_states is None:
+            # 如果没有提供encoder_hidden_states，则退化为自注意力机制
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
+            # encoder_hidden_states归一化
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
+        # attn.to_k和attn.to_v都是nn.Linear，key和value最后一维是attn.inner_kv_dim
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
+        # 计算每个注意力头的维度
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
 
+        # query的形状从（batch, height * width, head_dim * heads）
+        # 转为(batch, heads, height * width, head_dim)，这是计算交叉注意力的要求
         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
+        # kv的维度可能和query不一致，这里看起来没有考虑kv_heads和heads不一致的情况
+        # 这里可能利用了广播机制？
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
@@ -2763,9 +2850,10 @@ class AttnProcessor2_0:
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
         hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            query, key, value, attn_mask = attention_mask, dropout_p = 0.0, is_causal = False
         )
 
+        # 恢复hidden_states的形状
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -4184,6 +4272,8 @@ class SpatialNorm(nn.Module):
         zq_channels (`int`):
             The number of channels for the quantized vector as described in the paper.
     """
+    # 空间归一化层，结合了GroupNorm和额外的空间条件（来自zq）
+    # 主要用于将额外的条件信息（如文本、图像或其他特征）注入到神经网络中
 
     def __init__(
         self,
@@ -4196,9 +4286,18 @@ class SpatialNorm(nn.Module):
         self.conv_b = nn.Conv2d(zq_channels, f_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, f: torch.Tensor, zq: torch.Tensor) -> torch.Tensor:
+        # f: 输入特征图，形状为 (batch_size, f_channels, height, width)
+        # zq: 量化向量，形状为 (batch_size, zq_channels, zq_height, zq_width)
+        # 返回: 经过空间归一化和条件调整后的特征图，形状为 (batch_size, f_channels, height, width)
+
+        # 调整zq的空间尺寸以匹配f的空间尺寸
         f_size = f.shape[-2:]
         zq = F.interpolate(zq, size=f_size, mode="nearest")
+
+        # 归一化输入特征图f
         norm_f = self.norm_layer(f)
+
+        # 应用条件限制
         new_f = norm_f * self.conv_y(zq) + self.conv_b(zq)
         return new_f
 

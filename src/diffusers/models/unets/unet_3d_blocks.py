@@ -548,27 +548,29 @@ class CrossAttnDownBlock3D(nn.Module):
 
 
 class DownBlock3D(nn.Module):
+    # 输入 → [ResNet2D + TemporalConvLayer] × num_layers → 可选的2D下采样 → 输出
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        temb_channels: int,
-        dropout: float = 0.0,
-        num_layers: int = 1,
-        resnet_eps: float = 1e-6,
-        resnet_time_scale_shift: str = "default",
-        resnet_act_fn: str = "swish",
-        resnet_groups: int = 32,
-        resnet_pre_norm: bool = True,
-        output_scale_factor: float = 1.0,
-        add_downsample: bool = True,
-        downsample_padding: int = 1,
+        in_channels: int,                           # 输入通道数量
+        out_channels: int,                          # 输出通道数量
+        temb_channels: int,                         # 时间嵌入通道数量
+        dropout: float = 0.0,                       # dropout概率
+        num_layers: int = 1,                        # 层数
+        resnet_eps: float = 1e-6,                   # resnet误差
+        resnet_time_scale_shift: str = "default",   # resnet时间缩放和平移
+        resnet_act_fn: str = "swish",               # resnet激活函数
+        resnet_groups: int = 32,                    # resnet做group norm的时候的组个数
+        resnet_pre_norm: bool = True,               # resent是否预先归一化
+        output_scale_factor: float = 1.0,           # 输出的缩放尺度
+        add_downsample: bool = True,                # 是否做降采样，如果做降采样，最后一层添加降采样层
+        downsample_padding: int = 1,                # 降采样的padding
     ):
         super().__init__()
         resnets = []
         temp_convs = []
 
         for i in range(num_layers):
+            # 只有第一层的通道数会变化，其余的层输出和输出通道数都是out_channels
             in_channels = in_channels if i == 0 else out_channels
             resnets.append(
                 ResnetBlock2D(
@@ -619,6 +621,10 @@ class DownBlock3D(nn.Module):
         temb: Optional[torch.Tensor] = None,
         num_frames: int = 1,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        # hidden_states，输入: (B * T, C, H, W) B = batch, T = 帧数, C = 通道, H = 高, W = 宽
+        # temb，输入(B, temb_channels) B = batch，temb_channels = 时间嵌入维度
+        # num_frames，视频帧数
+
         output_states = ()
 
         for resnet, temp_conv in zip(self.resnets, self.temp_convs):

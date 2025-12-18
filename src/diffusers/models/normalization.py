@@ -278,7 +278,8 @@ class AdaGroupNorm(nn.Module):
         act_fn (`str`, *optional*, defaults to `None`): The activation function to use.
         eps (`float`, *optional*, defaults to `1e-5`): The epsilon value to use for numerical stability.
     """
-
+    # 用于在扩散模型中将时间条件嵌入
+    # 标准group norm的基础上，添加了可学习的缩放(scale)和偏移(shift)参数
     def __init__(
         self, embedding_dim: int, out_dim: int, num_groups: int, act_fn: Optional[str] = None, eps: float = 1e-5
     ):
@@ -291,16 +292,22 @@ class AdaGroupNorm(nn.Module):
         else:
             self.act = get_activation(act_fn)
 
+        # 时间嵌入到缩放和偏移参数的线性映射
         self.linear = nn.Linear(embedding_dim, out_dim * 2)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         if self.act:
             emb = self.act(emb)
         emb = self.linear(emb)
+
+        # 增加维度，和输入张量x对齐
         emb = emb[:, :, None, None]
         scale, shift = emb.chunk(2, dim=1)
 
+        # group norm
         x = F.group_norm(x, self.num_groups, eps=self.eps)
+
+        # 应用缩放和偏移
         x = x * (1 + scale) + shift
         return x
 

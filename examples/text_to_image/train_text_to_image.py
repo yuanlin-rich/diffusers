@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
+
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
@@ -72,6 +73,7 @@ def save_model_card(
     images: list = None,
     repo_folder: str = None,
 ):
+    # 生成模型卡片，将训练关键信息（模型、数据、参数、效果图）自动整理成规范的README.md文件，便于上传到模型库展示
     img_str = ""
     if len(images) > 0:
         image_grid = make_image_grid(images, 1, len(args.validation_prompts))
@@ -139,6 +141,7 @@ More information on all the CLI arguments and the environment are available on y
 
 
 def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
+    # 在训练中途，临时组装一个完整的推理管道来评估当前模型状态，其实就是用训练中的模型生成图像
     logger.info("Running validation... ")
 
     pipeline = StableDiffusionPipeline.from_pretrained(
@@ -146,7 +149,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
         vae=accelerator.unwrap_model(vae),
         text_encoder=accelerator.unwrap_model(text_encoder),
         tokenizer=tokenizer,
-        unet=accelerator.unwrap_model(unet),
+        unet=accelerator.unwrap_model(unet),                    # 注入当前训练中的UNet（最核心）
         safety_checker=None,
         revision=args.revision,
         variant=args.variant,
@@ -199,9 +202,12 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    # 输入扰动的尺度，推荐值为0.1。用于在训练时对输入加入噪声，提高模型鲁棒性
     parser.add_argument(
         "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
     )
+
+    # 预训练模型的路径或HuggingFace模型标识符。必须提供
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -209,6 +215,8 @@ def parse_args():
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
+
+    # 预训练模型的版本，可以是分支、标签或提交ID。非必须
     parser.add_argument(
         "--revision",
         type=str,
@@ -216,12 +224,16 @@ def parse_args():
         required=False,
         help="Revision of pretrained model identifier from huggingface.co/models.",
     )
+
+    # 模型文件的变体，例如fp16，用于指定加载的模型文件类型。
     parser.add_argument(
         "--variant",
         type=str,
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
+
+    # 数据集名称，可以是HuggingFace hub上的数据集，也可以是本地路径
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -232,12 +244,16 @@ def parse_args():
             " or to a folder containing files that 🤗 Datasets can understand."
         ),
     )
+
+    # 据集的配置名称，如果数据集有多个配置则需要指定。
     parser.add_argument(
         "--dataset_config_name",
         type=str,
         default=None,
         help="The config of the Dataset, leave as None if there's only one config.",
     )
+
+    # 本地训练数据的路径，如果没有指定dataset_name，则必须提供
     parser.add_argument(
         "--train_data_dir",
         type=str,
@@ -248,15 +264,21 @@ def parse_args():
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
     )
+
+    # 数据集中的图像列名称
     parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing an image."
     )
+
+    # 数据集中的文本列名称
     parser.add_argument(
         "--caption_column",
         type=str,
         default="text",
         help="The column of the dataset containing a caption or a list of captions.",
     )
+
+    # 最大训练样本数，用于调试或快速训练，如果设置则截断数据集
     parser.add_argument(
         "--max_train_samples",
         type=int,
@@ -266,6 +288,8 @@ def parse_args():
             "value if set."
         ),
     )
+
+    #  用于验证的提示词列表，每个验证周期会评估并记录。
     parser.add_argument(
         "--validation_prompts",
         type=str,
@@ -273,18 +297,24 @@ def parse_args():
         nargs="+",
         help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
     )
+
+    # 输出目录，用于保存模型预测和检查点
     parser.add_argument(
         "--output_dir",
         type=str,
         default="sd-model-finetuned",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
+
+    # 缓存目录，用于存储下载的模型和数据集
     parser.add_argument(
         "--cache_dir",
         type=str,
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
+
+    # 随机种子，用于可重复性训练
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
@@ -295,6 +325,8 @@ def parse_args():
             " resolution"
         ),
     )
+
+    # 是否将图像中心裁剪到分辨率大小，默认随机裁剪
     parser.add_argument(
         "--center_crop",
         default=False,
@@ -304,44 +336,62 @@ def parse_args():
             " cropped. The images will be resized to the resolution first before cropping."
         ),
     )
+
+    # 是否随机水平翻转图像
     parser.add_argument(
         "--random_flip",
         action="store_true",
         help="whether to randomly flip images horizontally",
     )
+
+    # 训练批次大小
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
+
+    # 训练轮数
     parser.add_argument("--num_train_epochs", type=int, default=100)
+
+    # 最大训练步数，如果设置则覆盖num_train_epochs
     parser.add_argument(
         "--max_train_steps",
         type=int,
         default=None,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
+
+    # 梯度累积步数，在反向传播/更新参数之前累积的更新步数
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
+
+    # 是否使用梯度检查点，以节省内存（但会减慢反向传播速度）
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
+
+    # 初始学习率（在可能的热身之后）
     parser.add_argument(
         "--learning_rate",
         type=float,
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
+
+    # 是否根据GPU数量、梯度累积步数和批次大小缩放学习率
     parser.add_argument(
         "--scale_lr",
         action="store_true",
         default=False,
         help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
     )
+
+    # 学习率调度器类型，可选["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
     parser.add_argument(
         "--lr_scheduler",
         type=str,
@@ -351,9 +401,13 @@ def parse_args():
             ' "constant", "constant_with_warmup"]'
         ),
     )
+
+    # 学习率预热步数
     parser.add_argument(
         "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
     )
+
+    # 用于重新平衡损失的SNR加权gamma，推荐值为5.0。
     parser.add_argument(
         "--snr_gamma",
         type=float,
@@ -361,6 +415,8 @@ def parse_args():
         help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
         "More details here: https://huggingface.co/papers/2303.09556.",
     )
+
+    # 是否使用DREAM训练方法，这种方法通过额外的前向传播提高训练效率和准确性
     parser.add_argument(
         "--dream_training",
         action="store_true",
@@ -369,15 +425,21 @@ def parse_args():
             "expense of doing an extra forward pass. See: https://huggingface.co/papers/2312.00210"
         ),
     )
+
+    # DREAM细节保留因子p，推荐值大于0，默认1.0
     parser.add_argument(
         "--dream_detail_preservation",
         type=float,
         default=1.0,
         help="Dream detail preservation factor p (should be greater than 0; default=1.0, as suggested in the paper)",
     )
+
+    # 是否使用8位Adam优化器，以节省内存
     parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
+
+    # 允许在Ampere GPU上使用TF32以加快训练速度
     parser.add_argument(
         "--allow_tf32",
         action="store_true",
@@ -386,9 +448,17 @@ def parse_args():
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
         ),
     )
+
+    # 是否使用EMA（指数移动平均）模型来稳定训练
     parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
+
+    # 是否在训练步骤中将EMA模型卸载到CPU，以节省GPU内存
     parser.add_argument("--offload_ema", action="store_true", help="Offload EMA model to CPU during training step.")
+
+    # 是否使用更快的foreach实现EMA模型
     parser.add_argument("--foreach_ema", action="store_true", help="Use faster foreach implementation of EMAModel.")
+
+    # 预训练非EMA模型的版本，可以是分支、标签或提交ID
     parser.add_argument(
         "--non_ema_revision",
         type=str,
@@ -399,6 +469,8 @@ def parse_args():
             " remote repository specified with --pretrained_model_name_or_path."
         ),
     )
+
+    # 加载数据的进程数量
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -407,25 +479,45 @@ def parse_args():
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
     )
+
+    # Adam优化器的beta1参数
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
+
+    # Adam优化器的beta2参数
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
+
+    # Adam优化器的权重衰减参数
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
+
+    # Adam优化器的epsilon参数
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
+
+    # 最大梯度范数，用于梯度裁剪
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+
+    # 是否发布到hub上
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
+
+    # HuggingFace Hub的身份验证令牌
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+
+    # 预测类型，预测噪声还是v_prediction
     parser.add_argument(
         "--prediction_type",
         type=str,
         default=None,
         help="The prediction_type that shall be used for training. Choose between 'epsilon' or 'v_prediction' or leave `None`. If left to `None` the default prediction type of the scheduler: `noise_scheduler.config.prediction_type` is chosen.",
     )
+
+    # huggingface hub模型标识符
     parser.add_argument(
         "--hub_model_id",
         type=str,
         default=None,
         help="The name of the repository to keep in sync with the local `output_dir`.",
     )
+
+    # tensorboard日志目录
     parser.add_argument(
         "--logging_dir",
         type=str,
@@ -435,6 +527,8 @@ def parse_args():
             " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
         ),
     )
+
+    # 混合精度训练选项
     parser.add_argument(
         "--mixed_precision",
         type=str,
@@ -446,6 +540,8 @@ def parse_args():
             " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
         ),
     )
+
+    # 报告结果上传到tensorboared还是wandb
     parser.add_argument(
         "--report_to",
         type=str,
@@ -455,7 +551,11 @@ def parse_args():
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         ),
     )
+
+    # 多gpu训练，为每个gpu分配一个索引
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+
+    # 检查点保存间隔步数
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -465,12 +565,16 @@ def parse_args():
             " training using `--resume_from_checkpoint`."
         ),
     )
+
+    # 最大检查点数量，超过则删除最旧的
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
         default=None,
         help=("Max number of checkpoints to store."),
     )
+
+    # 从指定检查点恢复训练的路径或标识符
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
@@ -480,16 +584,24 @@ def parse_args():
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
     )
+
+    # 是否启用xformers以节省内存和加快训练
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
+
+    # 输入噪声偏移的尺度
     parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
+
+    # 验证周期数
     parser.add_argument(
         "--validation_epochs",
         type=int,
         default=5,
         help="Run validation every X epochs.",
     )
+
+    # 跟踪器项目名称
     parser.add_argument(
         "--tracker_project_name",
         type=str,
@@ -499,6 +611,8 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+
+    # 图像调整的插值方法
     parser.add_argument(
         "--image_interpolation_mode",
         type=str,
@@ -509,12 +623,16 @@ def parse_args():
         help="The image interpolation method to use for resizing images.",
     )
 
+    # 解析命令行参数
     args = parser.parse_args()
+
+    # 设置本地排名以支持分布式训练
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
     # Sanity checks
+    # 没有指定数据集名称或训练数据目录则报错
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
 
@@ -529,12 +647,14 @@ def main():
     args = parse_args()
 
     if args.report_to == "wandb" and args.hub_token is not None:
+        # 不准讲hub信息上传到wandb
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
             " Please use `hf auth login` to authenticate with the Hub."
         )
 
     if args.non_ema_revision is not None:
+        # non_ema_revision已经被废弃
         deprecate(
             "non_ema_revision!=None",
             "0.15.0",
@@ -545,13 +665,15 @@ def main():
         )
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
+    # accelerator配置，目前只能看到输出目录和日志相关的设置
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
+    # 分布式训练工具
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
-        project_config=accelerator_project_config,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,   # 梯度累计步数
+        mixed_precision=args.mixed_precision,                           # 混合精度
+        log_with=args.report_to,                                        # 上传到那个平台
+        project_config=accelerator_project_config,                      # accelerator配置，目前只能看到输出目录和日志相关的设置
     )
 
     # Disable AMP for MPS.
@@ -565,6 +687,8 @@ def main():
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
+
+    # 设置日志等级，主进程日志更加详细
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -594,6 +718,7 @@ def main():
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
 
+    # zero-3，模型参数、梯度、优化器状态分片到多个GPU，节省内存（普通的多gpu训练，每个gpu都有完整的参数）
     def deepspeed_zero_init_disabled_context_manager():
         """
         returns either a context list that includes one that will disable zero.Init or an empty context list
@@ -614,13 +739,15 @@ def main():
     # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
     # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+        # 保证每个gpu都有完整的CLIPTextModel和AutoencoderKL模型
         text_encoder = CLIPTextModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
         )
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
         )
-
+        
+    # 但是每个gpu只有unet的部分模型参数、梯度、优化器状态
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
@@ -1000,6 +1127,7 @@ def main():
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
+                    # 预测速度？
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")

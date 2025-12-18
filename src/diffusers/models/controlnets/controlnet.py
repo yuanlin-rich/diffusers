@@ -45,17 +45,44 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 @dataclass
 class ControlNetOutput(BaseOutput):
     """
-    The output of [`ControlNetModel`].
+    ControlNet 模型的输出数据结构。
+
+    ControlNet 通过提取输入条件图像的特征，生成一系列不同分辨率的特征图，
+    这些特征图用于条件化原始 UNet 的对应层。输出包含两部分：
+    1. 下采样块的特征样本（down_block_res_samples）
+    2. 中间块的特征样本（mid_block_res_sample）
 
     Args:
         down_block_res_samples (`tuple[torch.Tensor]`):
-            A tuple of downsample activations at different resolutions for each downsampling block. Each tensor should
-            be of shape `(batch_size, channel * resolution, height //resolution, width // resolution)`. Output can be
-            used to condition the original UNet's downsampling activations.
-        mid_down_block_re_sample (`torch.Tensor`):
-            The activation of the middle block (the lowest sample resolution). Each tensor should be of shape
-            `(batch_size, channel * lowest_resolution, height // lowest_resolution, width // lowest_resolution)`.
-            Output can be used to condition the original UNet's middle block activation.
+            一个元组，包含每个下采样块在不同分辨率下的激活特征。
+            每个张量的形状为 `(batch_size, channel * resolution, height // resolution, width // resolution)`。
+            这些特征可以用于条件化原始 UNet 的下采样激活。
+            具体来说：
+            - 元组的长度等于下采样块的数量（通常为4个）
+            - 每个张量的通道数对应相应块的输出通道数
+            - 空间分辨率逐级减半（如 64x64, 32x32, 16x16, 8x8）
+        mid_block_res_sample (`torch.Tensor`):
+            中间块（最低采样分辨率）的激活特征。
+            张量形状为 `(batch_size, channel * lowest_resolution, height // lowest_resolution, width // lowest_resolution)`。
+            用于条件化原始 UNet 的中间块激活。
+            通常这是分辨率最低的特征图（如 8x8），包含最高级别的语义信息。
+
+    Example:
+        ```python
+        # 使用 ControlNet 进行前向传播
+        output = controlnet(
+            sample=noisy_latents,
+            timestep=timestep,
+            encoder_hidden_states=text_embeddings,
+            controlnet_cond=condition_image
+        )
+        
+        # 获取下采样块特征
+        down_features = output.down_block_res_samples  # 元组，包含4个特征图
+        
+        # 获取中间块特征
+        mid_feature = output.mid_block_res_sample  # 单个特征图
+        ```
     """
 
     down_block_res_samples: Tuple[torch.Tensor]
@@ -64,44 +91,85 @@ class ControlNetOutput(BaseOutput):
 
 class ControlNetConditioningEmbedding(nn.Module):
     """
-    Quoting from https://huggingface.co/papers/2302.05543: "Stable Diffusion uses a pre-processing method similar to
-    VQ-GAN [11] to convert the entire dataset of 512 × 512 images into smaller 64 × 64 “latent images” for stabilized
-    training. This requires ControlNets to convert image-based conditions to 64 × 64 feature space to match the
-    convolution size. We use a tiny network E(·) of four convolution layers with 4 × 4 kernels and 2 × 2 strides
-    (activated by ReLU, channels are 16, 32, 64, 128, initialized with Gaussian weights, trained jointly with the full
-    model) to encode image-space conditions ... into feature maps ..."
+    条件图像编码器，将输入的条件图像编码到特征空间。
+
+    根据 ControlNet 论文 (https://huggingface.co/papers/2302.05543)：
+    "Stable Diffusion 使用类似于 VQ-GAN 的预处理方法，将整个数据集的 512×512 图像转换为更小的 64×64 '潜在图像'以稳定训练。
+    这要求 ControlNet 将基于图像的条件转换为 64×64 特征空间以匹配卷积大小。我们使用一个由四个卷积层组成的微型网络 E(·)，
+    具有 4×4 核和 2×2 步长（使用 ReLU 激活，通道数为 16, 32, 64, 128，使用高斯权重初始化，与完整模型联合训练）
+    将图像空间条件编码为特征图..."
+
+    该网络的作用是将任意尺寸的条件图像（如边缘图、深度图、姿态图等）编码为与 UNet 潜在空间相匹配的特征表示。
+
+    Args:
+        conditioning_embedding_channels (int):
+            输出特征图的通道数，通常与 UNet 第一层的通道数相同（如 320）。
+        conditioning_channels (int, optional):
+            输入条件图像的通道数。默认为 3（RGB 图像）。
+        block_out_channels (Tuple[int, ...], optional):
+            每个编码块的输出通道数。默认为 (16, 32, 96, 256)。
+
+    Architecture:
+        1. 输入卷积层 (conv_in): 3x3 卷积，将输入通道映射到第一个块的通道数
+        2. 编码块序列 (blocks): 每个块包含：
+           - 一个 3x3 卷积（保持通道数不变）
+           - 一个 3x3 卷积（步长为 2，进行下采样，增加通道数）
+        3. 输出卷积层 (conv_out): 3x3 卷积，使用零初始化，将最终通道数映射到目标通道数
+
+    网络通过逐步下采样将输入图像转换为较低分辨率的特征图，同时增加通道数以捕获更丰富的语义信息。
     """
 
     def __init__(
         self,
-        conditioning_embedding_channels: int,
-        conditioning_channels: int = 3,
-        block_out_channels: Tuple[int, ...] = (16, 32, 96, 256),
+        conditioning_embedding_channels: int,                       # 输出通道数
+        conditioning_channels: int = 3,                             # 输入通道数
+        block_out_channels: Tuple[int, ...] = (16, 32, 96, 256),    # 每个块的输出通道数
     ):
         super().__init__()
 
+        # 输入卷积层：将条件图像映射到第一个特征块
         self.conv_in = nn.Conv2d(conditioning_channels, block_out_channels[0], kernel_size=3, padding=1)
 
+        # 编码块序列：逐步下采样并增加通道数
         self.blocks = nn.ModuleList([])
 
         for i in range(len(block_out_channels) - 1):
             channel_in = block_out_channels[i]
             channel_out = block_out_channels[i + 1]
+            # 第一个卷积：保持空间分辨率和通道数不变
             self.blocks.append(nn.Conv2d(channel_in, channel_in, kernel_size=3, padding=1))
+            # 第二个卷积：步长为2进行下采样，同时增加通道数
             self.blocks.append(nn.Conv2d(channel_in, channel_out, kernel_size=3, padding=1, stride=2))
 
+        # 输出卷积层：使用零初始化，确保训练开始时 ControlNet 不影响 UNet
         self.conv_out = zero_module(
             nn.Conv2d(block_out_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
         )
 
-    def forward(self, conditioning):
+    def forward(self, conditioning: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播：将条件图像编码为特征图。
+
+        Args:
+            conditioning (torch.Tensor):
+                输入条件图像，形状为 `(batch_size, conditioning_channels, height, width)`。
+                通常为 RGB 图像或其他条件图像（如边缘图、深度图等）。
+
+        Returns:
+            torch.Tensor:
+                编码后的特征图，形状为 `(batch_size, conditioning_embedding_channels, height//scale, width//scale)`。
+                其中 scale 取决于网络的下采样次数（通常为 8 倍下采样）。
+        """
+        # 初始卷积 + SiLU 激活
         embedding = self.conv_in(conditioning)
         embedding = F.silu(embedding)
 
+        # 通过所有编码块
         for block in self.blocks:
             embedding = block(embedding)
             embedding = F.silu(embedding)
 
+        # 最终输出卷积
         embedding = self.conv_out(embedding)
 
         return embedding
@@ -109,71 +177,81 @@ class ControlNetConditioningEmbedding(nn.Module):
 
 class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):
     """
-    A ControlNet model.
+    ControlNet 模型，用于在扩散过程中添加空间条件控制。
+
+    ControlNet 是一种神经网络架构，用于向预训练的扩散模型（如 Stable Diffusion）添加额外的条件控制。
+    它通过提取条件图像（如边缘图、深度图、姿态图等）的特征，并将这些特征注入到 UNet 的各个层中，
+    从而实现对生成过程的精确空间控制。
+
+    核心思想：
+        1. 复制原始 UNet 的编码器部分（下采样块和中间块）
+        2. 添加条件图像编码器（ControlNetConditioningEmbedding）将条件图像转换为特征
+        3. 为每个 UNet 层添加可训练的零初始化卷积层（controlnet_down_blocks 和 controlnet_mid_block）
+        4. 在推理时，将条件特征与 UNet 特征相加，然后通过零初始化卷积层进行变换
+
+    零初始化技巧：
+        所有 ControlNet 特定的卷积层都以零权重初始化，确保在训练开始时 ControlNet 不会影响原始 UNet 的行为，
+        从而稳定训练过程。
 
     Args:
         in_channels (`int`, defaults to 4):
-            The number of channels in the input sample.
+            输入样本的通道数。对于潜在扩散模型，通常是 4（潜在空间维度）。
         flip_sin_to_cos (`bool`, defaults to `True`):
-            Whether to flip the sin to cos in the time embedding.
+            是否在时间嵌入中将 sin 翻转为 cos。影响时间步的正弦余弦编码方式。
         freq_shift (`int`, defaults to 0):
-            The frequency shift to apply to the time embedding.
+            应用于时间嵌入的频率偏移。
         down_block_types (`tuple[str]`, defaults to `("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D")`):
-            The tuple of downsample blocks to use.
+            使用的下采样块类型的元组。必须与原始 UNet 的配置匹配。
         only_cross_attention (`Union[bool, Tuple[bool]]`, defaults to `False`):
+            是否只使用交叉注意力。如果为布尔值，应用于所有块；如果为元组，长度必须与 down_block_types 相同。
         block_out_channels (`tuple[int]`, defaults to `(320, 640, 1280, 1280)`):
-            The tuple of output channels for each block.
+            每个块的输出通道数。通常与原始 UNet 的通道配置相同。
         layers_per_block (`int`, defaults to 2):
-            The number of layers per block.
+            每个块中的层数。
         downsample_padding (`int`, defaults to 1):
-            The padding to use for the downsampling convolution.
+            下采样卷积使用的填充。
         mid_block_scale_factor (`float`, defaults to 1):
-            The scale factor to use for the mid block.
+            中间块使用的缩放因子。
         act_fn (`str`, defaults to "silu"):
-            The activation function to use.
+            使用的激活函数。
         norm_num_groups (`int`, *optional*, defaults to 32):
-            The number of groups to use for the normalization. If None, normalization and activation layers is skipped
-            in post-processing.
+            归一化使用的组数。如果为 None，则在后处理中跳过归一化和激活层。
         norm_eps (`float`, defaults to 1e-5):
-            The epsilon to use for the normalization.
+            归一化使用的 epsilon 值。
         cross_attention_dim (`int`, defaults to 1280):
-            The dimension of the cross attention features.
+            交叉注意力特征的维度。通常与文本编码器的输出维度相同。
         transformer_layers_per_block (`int` or `Tuple[int]`, *optional*, defaults to 1):
-            The number of transformer blocks of type [`~models.attention.BasicTransformerBlock`]. Only relevant for
-            [`~models.unet_2d_blocks.CrossAttnDownBlock2D`], [`~models.unet_2d_blocks.CrossAttnUpBlock2D`],
-            [`~models.unet_2d_blocks.UNetMidBlock2DCrossAttn`].
+            [`~models.attention.BasicTransformerBlock`] 类型的 transformer 块数量。
+            仅与 [`~models.unet_2d_blocks.CrossAttnDownBlock2D`]、[`~models.unet_2d_blocks.CrossAttnUpBlock2D`]、
+            [`~models.unet_2d_blocks.UNetMidBlock2DCrossAttn`] 相关。
         encoder_hid_dim (`int`, *optional*, defaults to None):
-            If `encoder_hid_dim_type` is defined, `encoder_hidden_states` will be projected from `encoder_hid_dim`
-            dimension to `cross_attention_dim`.
+            如果定义了 `encoder_hid_dim_type`，`encoder_hidden_states` 将从 `encoder_hid_dim` 维度投影到 `cross_attention_dim`。
         encoder_hid_dim_type (`str`, *optional*, defaults to `None`):
-            If given, the `encoder_hidden_states` and potentially other embeddings are down-projected to text
-            embeddings of dimension `cross_attention` according to `encoder_hid_dim_type`.
+            如果给定，`encoder_hidden_states` 和其他可能的嵌入将根据 `encoder_hid_dim_type` 下投影到 `cross_attention` 维度的文本嵌入。
         attention_head_dim (`Union[int, Tuple[int]]`, defaults to 8):
-            The dimension of the attention heads.
+            注意力头的维度。
         use_linear_projection (`bool`, defaults to `False`):
+            是否在线性投影中使用注意力。
         class_embed_type (`str`, *optional*, defaults to `None`):
-            The type of class embedding to use which is ultimately summed with the time embeddings. Choose from None,
-            `"timestep"`, `"identity"`, `"projection"`, or `"simple_projection"`.
+            使用的类别嵌入类型，最终与时间嵌入相加。可选 None、`"timestep"`、`"identity"`、`"projection"` 或 `"simple_projection"`。
         addition_embed_type (`str`, *optional*, defaults to `None`):
-            Configures an optional embedding which will be summed with the time embeddings. Choose from `None` or
-            "text". "text" will use the `TextTimeEmbedding` layer.
+            配置将与时间嵌入相加的可选嵌入。可选 `None` 或 "text"。"text" 将使用 `TextTimeEmbedding` 层。
         num_class_embeds (`int`, *optional*, defaults to 0):
-            Input dimension of the learnable embedding matrix to be projected to `time_embed_dim`, when performing
-            class conditioning with `class_embed_type` equal to `None`.
+            当 `class_embed_type` 等于 `None` 时，可学习嵌入矩阵的输入维度，将被投影到 `time_embed_dim`。
         upcast_attention (`bool`, defaults to `False`):
+            是否上投射注意力。
         resnet_time_scale_shift (`str`, defaults to `"default"`):
-            Time scale shift config for ResNet blocks (see `ResnetBlock2D`). Choose from `default` or `scale_shift`.
+            ResNet 块的时间尺度偏移配置（参见 `ResnetBlock2D`）。可选 `default` 或 `scale_shift`。
         projection_class_embeddings_input_dim (`int`, *optional*, defaults to `None`):
-            The dimension of the `class_labels` input when `class_embed_type="projection"`. Required when
-            `class_embed_type="projection"`.
+            当 `class_embed_type="projection"` 时，`class_labels` 输入的维度。当 `class_embed_type="projection"` 时必须提供。
         controlnet_conditioning_channel_order (`str`, defaults to `"rgb"`):
-            The channel order of conditional image. Will convert to `rgb` if it's `bgr`.
+            条件图像的通道顺序。如果是 `bgr` 将转换为 `rgb`。
         conditioning_embedding_out_channels (`tuple[int]`, *optional*, defaults to `(16, 32, 96, 256)`):
-            The tuple of output channel for each block in the `conditioning_embedding` layer.
+            `conditioning_embedding` 层中每个块的输出通道元组。
         global_pool_conditions (`bool`, defaults to `False`):
-            TODO(Patrick) - unused parameter.
+            TODO(Patrick) - 未使用的参数。
         addition_embed_type_num_heads (`int`, defaults to 64):
-            The number of heads to use for the `TextTimeEmbedding` layer.
+            `TextTimeEmbedding` 层使用的头数。
     """
 
     _supports_gradient_checkpointing = True
@@ -221,12 +299,12 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
     ):
         super().__init__()
 
-        # If `num_attention_heads` is not defined (which is the case for most models)
-        # it will default to `attention_head_dim`. This looks weird upon first reading it and it is.
-        # The reason for this behavior is to correct for incorrectly named variables that were introduced
-        # when this library was created. The incorrect naming was only discovered much later in https://github.com/huggingface/diffusers/issues/2011#issuecomment-1547958131
-        # Changing `attention_head_dim` to `num_attention_heads` for 40,000+ configurations is too backwards breaking
-        # which is why we correct for the naming here.
+        # 如果 `num_attention_heads` 未定义（大多数模型都是这种情况）
+        # 它将默认为 `attention_head_dim`。这看起来很奇怪，但确实如此。
+        # 这种行为的原因是为了纠正库创建时引入的错误命名变量。
+        # 这个错误命名直到后来才在 https://github.com/huggingface/diffusers/issues/2011#issuecomment-1547958131 中被发现
+        # 为 40,000+ 配置将 `attention_head_dim` 更改为 `num_attention_heads` 会破坏向后兼容性
+        # 因此我们在这里纠正命名。
         num_attention_heads = num_attention_heads or attention_head_dim
 
         # Check inputs
@@ -235,11 +313,13 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
                 f"Must provide the same number of `block_out_channels` as `down_block_types`. `block_out_channels`: {block_out_channels}. `down_block_types`: {down_block_types}."
             )
 
+        # only_cross_attention是布尔值，或者者是一个布尔值元组，其长度必须与down_block_types相同
         if not isinstance(only_cross_attention, bool) and len(only_cross_attention) != len(down_block_types):
             raise ValueError(
                 f"Must provide the same number of `only_cross_attention` as `down_block_types`. `only_cross_attention`: {only_cross_attention}. `down_block_types`: {down_block_types}."
             )
 
+        # attention_head_dim是整数，或者者是一个整数元组，其长度必须与down_block_types相同
         if not isinstance(num_attention_heads, int) and len(num_attention_heads) != len(down_block_types):
             raise ValueError(
                 f"Must provide the same number of `num_attention_heads` as `down_block_types`. `num_attention_heads`: {num_attention_heads}. `down_block_types`: {down_block_types}."
@@ -250,6 +330,8 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
 
         # input
         conv_in_kernel = 3
+
+        # 这样设置padding，保证输入和输出的空间尺度不变
         conv_in_padding = (conv_in_kernel - 1) // 2
         self.conv_in = nn.Conv2d(
             in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
@@ -265,19 +347,24 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
             act_fn=act_fn,
         )
 
+        # 设置了encoder_hid_dim，如果没有设置encoder_hid_dim_type，则默认为'text_proj'
         if encoder_hid_dim_type is None and encoder_hid_dim is not None:
             encoder_hid_dim_type = "text_proj"
             self.register_to_config(encoder_hid_dim_type=encoder_hid_dim_type)
             logger.info("encoder_hid_dim_type defaults to 'text_proj' as `encoder_hid_dim` is defined.")
 
+        # 设置了encoder_hid_dim_type，则必须设置encoder_hid_dim，否则抛出异常
         if encoder_hid_dim is None and encoder_hid_dim_type is not None:
             raise ValueError(
                 f"`encoder_hid_dim` has to be defined when `encoder_hid_dim_type` is set to {encoder_hid_dim_type}."
             )
 
+        # 根据encoder_hid_dim_type设置encoder_hidden_states的投影层
         if encoder_hid_dim_type == "text_proj":
+            # 简单的线性投影
             self.encoder_hid_proj = nn.Linear(encoder_hid_dim, cross_attention_dim)
         elif encoder_hid_dim_type == "text_image_proj":
+            # 如果使用文本-图像投影，则需要TextImageProjection层
             # image_embed_dim DOESN'T have to be `cross_attention_dim`. To not clutter the __init__ too much
             # they are set to `cross_attention_dim` here as this is exactly the required dimension for the currently only use
             # case when `addition_embed_type == "text_image_proj"` (Kandinsky 2.1)`
@@ -288,6 +375,7 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
             )
 
         elif encoder_hid_dim_type is not None:
+            # encoder_hid_dim_type 设置错误，只能是 None, 'text_proj' or 'text_image_proj'
             raise ValueError(
                 f"encoder_hid_dim_type: {encoder_hid_dim_type} must be None, 'text_proj' or 'text_image_proj'."
             )
@@ -296,12 +384,16 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
 
         # class embedding
         if class_embed_type is None and num_class_embeds is not None:
+            # 没有指定class_embed_type，但指定了num_class_embeds，默认为simple_projection
             self.class_embedding = nn.Embedding(num_class_embeds, time_embed_dim)
         elif class_embed_type == "timestep":
+            # class_embed_type为timestep，使用TimestepEmbedding
             self.class_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
         elif class_embed_type == "identity":
+            # class_embed_type为identity，使用恒等映射
             self.class_embedding = nn.Identity(time_embed_dim, time_embed_dim)
         elif class_embed_type == "projection":
+            # class_embed_type为projection，使用投影层，需要指定projection_class_embeddings_input_dim
             if projection_class_embeddings_input_dim is None:
                 raise ValueError(
                     "`class_embed_type`: 'projection' requires `projection_class_embeddings_input_dim` be set"
@@ -317,6 +409,7 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
         else:
             self.class_embedding = None
 
+        # additional embedding
         if addition_embed_type == "text":
             if encoder_hid_dim is not None:
                 text_time_embedding_from_dim = encoder_hid_dim
@@ -350,18 +443,22 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
         self.down_blocks = nn.ModuleList([])
         self.controlnet_down_blocks = nn.ModuleList([])
 
+        # 只做交叉注意力
         if isinstance(only_cross_attention, bool):
             only_cross_attention = [only_cross_attention] * len(down_block_types)
 
+        # 交叉注意力头数维度
         if isinstance(attention_head_dim, int):
             attention_head_dim = (attention_head_dim,) * len(down_block_types)
 
+        # 交叉注意力头数
         if isinstance(num_attention_heads, int):
             num_attention_heads = (num_attention_heads,) * len(down_block_types)
 
         # down
         output_channel = block_out_channels[0]
 
+        # 零卷积块，输入通道和输出通道都是output_channel
         controlnet_block = nn.Conv2d(output_channel, output_channel, kernel_size=1)
         controlnet_block = zero_module(controlnet_block)
         self.controlnet_down_blocks.append(controlnet_block)
@@ -393,6 +490,7 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
             )
             self.down_blocks.append(down_block)
 
+            # 每个down_block对应的controlnet_down_blocks
             for _ in range(layers_per_block):
                 controlnet_block = nn.Conv2d(output_channel, output_channel, kernel_size=1)
                 controlnet_block = zero_module(controlnet_block)
@@ -450,12 +548,37 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
         conditioning_channels: int = 3,
     ):
         r"""
-        Instantiate a [`ControlNetModel`] from [`UNet2DConditionModel`].
+        从 [`UNet2DConditionModel`] 实例化 [`ControlNetModel`]。
+
+        这是创建 ControlNet 的便捷方法，它会复制 UNet 的配置和权重（如果指定）。
+        ControlNet 架构与 UNet 的编码器部分相同，因此可以直接复制权重以加速训练。
 
         Parameters:
             unet (`UNet2DConditionModel`):
-                The UNet model weights to copy to the [`ControlNetModel`]. All configuration options are also copied
-                where applicable.
+                要复制到 [`ControlNetModel`] 的 UNet 模型权重。所有适用的配置选项也会被复制。
+            controlnet_conditioning_channel_order (`str`, defaults to `"rgb"`):
+                条件图像的通道顺序。
+            conditioning_embedding_out_channels (`tuple[int]`, *optional*, defaults to `(16, 32, 96, 256)`):
+                `conditioning_embedding` 层中每个块的输出通道元组。
+            load_weights_from_unet (`bool`, defaults to `True`):
+                是否从 UNet 加载权重。如果为 True，将复制 UNet 的卷积层、时间嵌入、下采样块和中间块的权重。
+                这可以加速 ControlNet 的训练，因为编码器部分已经预训练过。
+            conditioning_channels (`int`, defaults to 3):
+                条件图像的通道数。
+
+        Returns:
+            [`ControlNetModel`]:
+                新创建的 ControlNet 模型，配置与 UNet 相同，并可选地加载了 UNet 的权重。
+
+        Example:
+            ```python
+            # 从预训练的 UNet 创建 ControlNet
+            unet = UNet2DConditionModel.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="unet")
+            controlnet = ControlNetModel.from_unet(unet)
+            
+            # 现在 controlnet 具有与 unet 相同的架构，并加载了权重
+            # 可以用于训练条件控制
+            ```
         """
         transformer_layers_per_block = (
             unet.config.transformer_layers_per_block if "transformer_layers_per_block" in unet.config else 1
@@ -500,6 +623,7 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
             conditioning_channels=conditioning_channels,
         )
 
+        # 从unet加载权重
         if load_weights_from_unet:
             controlnet.conv_in.load_state_dict(unet.conv_in.state_dict())
             controlnet.time_proj.load_state_dict(unet.time_proj.state_dict())
@@ -614,66 +738,104 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
         return_dict: bool = True,
     ) -> Union[ControlNetOutput, Tuple[Tuple[torch.Tensor, ...], torch.Tensor]]:
         """
-        The [`ControlNetModel`] forward method.
+        ControlNet 模型的前向传播方法。
+
+        该方法执行以下主要步骤：
+        1. 预处理条件图像（通道顺序调整、注意力掩码处理）
+        2. 时间步编码和条件嵌入（时间嵌入、类别嵌入、附加嵌入）
+        3. 条件图像编码（通过 ControlNetConditioningEmbedding）
+        4. 通过 UNet 编码器进行特征提取（下采样块和中间块）
+        5. 应用 ControlNet 特定的零初始化卷积层
+        6. 特征缩放（根据 conditioning_scale 和 guess_mode）
+        7. 返回条件特征
 
         Args:
             sample (`torch.Tensor`):
-                The noisy input tensor.
+                噪声输入张量，形状为 `(batch_size, in_channels, height, width)`。
+                通常是扩散过程中的噪声潜在表示。
             timestep (`Union[torch.Tensor, float, int]`):
-                The number of timesteps to denoise an input.
+                去噪输入的时间步数。可以是标量、张量或整数/浮点数。
             encoder_hidden_states (`torch.Tensor`):
-                The encoder hidden states.
+                编码器隐藏状态，通常是文本嵌入，形状为 `(batch_size, sequence_length, cross_attention_dim)`。
             controlnet_cond (`torch.Tensor`):
-                The conditional input tensor of shape `(batch_size, sequence_length, hidden_size)`.
+                条件输入张量，形状为 `(batch_size, conditioning_channels, height, width)`。
+                通常是条件图像（如边缘图、深度图、姿态图等）。
             conditioning_scale (`float`, defaults to `1.0`):
-                The scale factor for ControlNet outputs.
+                ControlNet 输出的缩放因子。控制条件影响的强度。
+                值越大，条件对生成的影响越强。
             class_labels (`torch.Tensor`, *optional*, defaults to `None`):
-                Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
+                可选的类别标签用于条件化。它们的嵌入将与时间步嵌入相加。
             timestep_cond (`torch.Tensor`, *optional*, defaults to `None`):
-                Additional conditional embeddings for timestep. If provided, the embeddings will be summed with the
-                timestep_embedding passed through the `self.time_embedding` layer to obtain the final timestep
-                embeddings.
+                时间步的附加条件嵌入。如果提供，这些嵌入将与通过 `self.time_embedding` 层的时间步嵌入相加，
+                以获得最终的时间步嵌入。
             attention_mask (`torch.Tensor`, *optional*, defaults to `None`):
-                An attention mask of shape `(batch, key_tokens)` is applied to `encoder_hidden_states`. If `1` the mask
-                is kept, otherwise if `0` it is discarded. Mask will be converted into a bias, which adds large
-                negative values to the attention scores corresponding to "discard" tokens.
+                应用于 `encoder_hidden_states` 的注意力掩码，形状为 `(batch, key_tokens)`。
+                如果为 `1` 则保留掩码，如果为 `0` 则丢弃。掩码将转换为偏置，为 "丢弃" 标记的注意力分数添加大的负值。
             added_cond_kwargs (`dict`):
-                Additional conditions for the Stable Diffusion XL UNet.
+                Stable Diffusion XL UNet 的附加条件。
             cross_attention_kwargs (`dict[str]`, *optional*, defaults to `None`):
-                A kwargs dictionary that if specified is passed along to the `AttnProcessor`.
+                如果指定，将传递给 `AttnProcessor` 的关键字参数字典。
             guess_mode (`bool`, defaults to `False`):
-                In this mode, the ControlNet encoder tries its best to recognize the input content of the input even if
-                you remove all prompts. A `guidance_scale` between 3.0 and 5.0 is recommended.
+                在此模式下，即使移除所有提示，ControlNet 编码器也会尽力识别输入内容。
+                建议使用 3.0 到 5.0 之间的 `guidance_scale`。
+                当 guess_mode=True 时，不同层的特征会使用不同的缩放因子（从 0.1 到 1.0 的对数空间）。
             return_dict (`bool`, defaults to `True`):
-                Whether or not to return a [`~models.controlnets.controlnet.ControlNetOutput`] instead of a plain
-                tuple.
+                是否返回 [`~models.controlnets.controlnet.ControlNetOutput`] 而不是普通元组。
 
         Returns:
             [`~models.controlnets.controlnet.ControlNetOutput`] **or** `tuple`:
-                If `return_dict` is `True`, a [`~models.controlnets.controlnet.ControlNetOutput`] is returned,
-                otherwise a tuple is returned where the first element is the sample tensor.
+                如果 `return_dict` 为 `True`，则返回 [`~models.controlnets.controlnet.ControlNetOutput`]，
+                否则返回一个元组，其中第一个元素是下采样块特征样本的元组，第二个元素是中间块特征样本。
+
+        Example:
+            ```python
+            # 初始化 ControlNet
+            controlnet = ControlNetModel.from_unet(unet)
+            
+            # 准备输入
+            noisy_latents = torch.randn(1, 4, 64, 64)
+            timestep = torch.tensor([50])
+            text_embeddings = torch.randn(1, 77, 1280)
+            condition_image = torch.randn(1, 3, 512, 512)  # 边缘图或深度图
+            
+            # 前向传播
+            with torch.no_grad():
+                output = controlnet(
+                    sample=noisy_latents,
+                    timestep=timestep,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=condition_image,
+                    conditioning_scale=1.0,
+                    guess_mode=False
+                )
+            
+            # 使用输出条件化 UNet
+            down_block_res_samples = output.down_block_res_samples
+            mid_block_res_sample = output.mid_block_res_sample
+            ```
         """
-        # check channel order
+        # 检查通道顺序
         channel_order = self.config.controlnet_conditioning_channel_order
 
         if channel_order == "rgb":
-            # in rgb order by default
+            # 默认是rgb顺序，无需处理
             ...
         elif channel_order == "bgr":
+            # 如果是bgr顺序，翻转通道维度以转换为rgb
             controlnet_cond = torch.flip(controlnet_cond, dims=[1])
         else:
-            raise ValueError(f"unknown `controlnet_conditioning_channel_order`: {channel_order}")
+            raise ValueError(f"未知的 `controlnet_conditioning_channel_order`: {channel_order}")
 
-        # prepare attention_mask
+        # 准备注意力掩码
         if attention_mask is not None:
             attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
             attention_mask = attention_mask.unsqueeze(1)
 
-        # 1. time
+        # 1. 时间步处理
         timesteps = timestep
         if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            # This would be a good case for the `match` statement (Python 3.10+)
+            # TODO: 这需要在 CPU 和 GPU 之间同步。所以尽可能传递张量形式的时间步
+            # 这是使用 `match` 语句（Python 3.10+）的好案例
             is_mps = sample.device.type == "mps"
             is_npu = sample.device.type == "npu"
             if isinstance(timestep, float):
@@ -684,14 +846,14 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
         elif len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
 
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        # 以与 ONNX/Core ML 兼容的方式广播到批次维度
         timesteps = timesteps.expand(sample.shape[0])
 
         t_emb = self.time_proj(timesteps)
 
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
+        # timesteps 不包含任何权重，总是返回 f32 张量
+        # 但 time_embedding 可能实际上在 fp16 中运行。所以我们需要在这里进行类型转换。
+        # 可能有更好的封装方式。
         t_emb = t_emb.to(dtype=sample.dtype)
 
         emb = self.time_embedding(t_emb, timestep_cond)
@@ -802,7 +964,32 @@ class ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModel
         )
 
 
-def zero_module(module):
+def zero_module(module: nn.Module) -> nn.Module:
+    """
+    将给定模块的所有参数初始化为零。
+
+    这是 ControlNet 架构中的一个关键技巧：所有 ControlNet 特定的层都以零权重初始化，
+    确保在训练开始时 ControlNet 不会影响原始 UNet 的行为。这使得训练更加稳定，
+    因为模型最初表现为原始 UNet，然后逐渐学习添加条件控制。
+
+    Args:
+        module (nn.Module):
+            要零初始化的 PyTorch 模块。通常是卷积层或线性层。
+
+    Returns:
+        nn.Module:
+            参数已零初始化的相同模块。
+
+    Example:
+        ```python
+        # 创建一个卷积层并零初始化
+        conv = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        conv = zero_module(conv)
+        
+        # 现在 conv 的所有权重和偏置都为零
+        print(conv.weight.sum())  # 输出: tensor(0.)
+        ```
+    """
     for p in module.parameters():
         nn.init.zeros_(p)
     return module

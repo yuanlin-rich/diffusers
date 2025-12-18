@@ -43,7 +43,10 @@ class DDIMSchedulerOutput(BaseOutput):
             `pred_original_sample` can be used to preview progress or for guidance.
     """
 
+    # 上一个时间步的样本 (x_{t-1})
     prev_sample: torch.Tensor
+
+    # 预测的原始样本
     pred_original_sample: Optional[torch.Tensor] = None
 
 

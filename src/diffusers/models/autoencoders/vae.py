@@ -699,6 +699,7 @@ class DiagonalGaussianDistribution(object):
             )
 
     def sample(self, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        # 采样
         # make sure sample is on the same device as the parameters and has same dtype
         sample = randn_tensor(
             self.mean.shape,
@@ -710,6 +711,7 @@ class DiagonalGaussianDistribution(object):
         return x
 
     def kl(self, other: "DiagonalGaussianDistribution" = None) -> torch.Tensor:
+        # 计算和另外一个分布的kl散度
         if self.deterministic:
             return torch.Tensor([0.0])
         else:
@@ -729,6 +731,7 @@ class DiagonalGaussianDistribution(object):
                 )
 
     def nll(self, sample: torch.Tensor, dims: Tuple[int, ...] = [1, 2, 3]) -> torch.Tensor:
+        # 负似然对数
         if self.deterministic:
             return torch.Tensor([0.0])
         logtwopi = np.log(2.0 * np.pi)

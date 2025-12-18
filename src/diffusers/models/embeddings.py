@@ -51,8 +51,11 @@ def get_timestep_embedding(
     Returns
         torch.Tensor: an [N x dim] Tensor of positional embeddings.
     """
+    # 确定输入是1D张量
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
+    # 正弦余弦各占一半维度
+    # 计算指数衰减的频率
     half_dim = embedding_dim // 2
     exponent = -math.log(max_period) * torch.arange(
         start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
@@ -1260,6 +1263,7 @@ def apply_rotary_emb_allegro(x: torch.Tensor, freqs_cis, positions):
 
 
 class TimestepEmbedding(nn.Module):
+    # 将基本的时间步嵌入向量进一步转换为神经网络更容易使用的特征表示
     def __init__(
         self,
         in_channels: int,
@@ -1274,6 +1278,7 @@ class TimestepEmbedding(nn.Module):
 
         self.linear_1 = nn.Linear(in_channels, time_embed_dim, sample_proj_bias)
 
+        # 条件向量
         if cond_proj_dim is not None:
             self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias=False)
         else:
@@ -1294,6 +1299,7 @@ class TimestepEmbedding(nn.Module):
 
     def forward(self, sample, condition=None):
         if condition is not None:
+            # 条件不为空，和时间嵌入相加
             sample = sample + self.cond_proj(condition)
         sample = self.linear_1(sample)
 
@@ -1308,7 +1314,12 @@ class TimestepEmbedding(nn.Module):
 
 
 class Timesteps(nn.Module):
+    # 时间嵌入，离散的时间步（timestep）转换为连续的向量表示，以便神经网络能够处理时间信息
     def __init__(self, num_channels: int, flip_sin_to_cos: bool, downscale_freq_shift: float, scale: int = 1):
+        # num_channels: 嵌入向量的维度
+        # flip_sin_to_cos: 是否将正弦和余弦函数翻转
+        # downscale_freq_shift: 频率缩放因子
+        # scale: 缩放因子
         super().__init__()
         self.num_channels = num_channels
         self.flip_sin_to_cos = flip_sin_to_cos
@@ -1316,6 +1327,10 @@ class Timesteps(nn.Module):
         self.scale = scale
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        # timesteps: 输入的时间步张量，有多种输入形式
+        # timesteps = torch.tensor([0, 100, 500, 1000])
+        # timesteps = torch.tensor([[0], [100], [500], [1000]])
+        # imesteps = torch.tensor([100])
         t_emb = get_timestep_embedding(
             timesteps,
             self.num_channels,
@@ -1486,16 +1501,19 @@ class LabelEmbedding(nn.Module):
 
 
 class TextImageProjection(nn.Module):
+    # 将文本和图像嵌入向量投影到一个共同的空间中，以便后续的处理和融合
     def __init__(
         self,
-        text_embed_dim: int = 1024,
-        image_embed_dim: int = 768,
-        cross_attention_dim: int = 768,
-        num_image_text_embeds: int = 10,
+        text_embed_dim: int = 1024,         # 输入文本特征的维度
+        image_embed_dim: int = 768,         # 输入图像特征的维度
+        cross_attention_dim: int = 768,     # 目标投影维度（两种模态统一后的维度）
+        num_image_text_embeds: int = 10,    # 将图像特征转换为多少个 token
     ):
         super().__init__()
 
         self.num_image_text_embeds = num_image_text_embeds
+        
+        # 将单个图像特征向量扩展为num_image_text_embeds个token，每个token维度为cross_attention_dim
         self.image_embeds = nn.Linear(image_embed_dim, self.num_image_text_embeds * cross_attention_dim)
         self.text_proj = nn.Linear(text_embed_dim, cross_attention_dim)
 
@@ -1509,6 +1527,7 @@ class TextImageProjection(nn.Module):
         # text
         text_embeds = self.text_proj(text_embeds)
 
+        # 最后返回num_image_text_embeds + 1个token
         return torch.cat([image_text_embeds, text_embeds], dim=1)
 
 

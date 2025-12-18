@@ -14,6 +14,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+T2I-Adapter for Stable Diffusion XL 训练脚本。
+
+该脚本用于训练 T2I-Adapter 模型，这是一种轻量级的条件控制模型，
+可以添加到预训练的 Stable Diffusion XL 模型中，实现基于条件图像
+（如边缘图、深度图、姿态图等）的精确图像生成控制。
+
+主要功能：
+1. 支持从 Hugging Face Hub 或本地加载预训练模型
+2. 支持分布式训练和混合精度训练
+3. 包含完整的训练循环、验证和模型保存
+4. 支持 TensorBoard 和 WandB 日志记录
+5. 支持将训练好的模型上传到 Hugging Face Hub
+
+使用示例：
+    accelerate launch train_t2i_adapter_sdxl.py \
+        --pretrained_model_name_or_path="stabilityai/stable-diffusion-xl-base-1.0" \
+        --dataset_name="your_dataset" \
+        --output_dir="t2iadapter-model" \
+        --train_batch_size=4 \
+        --num_train_epochs=100 \
+        --checkpointing_steps=5000 \
+        --validation_steps=1000
+
+参考：
+    - T2I-Adapter 论文：https://arxiv.org/abs/2302.08453
+    - Stable Diffusion XL：https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0
+"""
+
 import argparse
 import functools
 import gc
@@ -67,6 +96,20 @@ logger = get_logger(__name__)
 
 
 def image_grid(imgs, rows, cols):
+    """
+    将多张图像排列成网格形式。
+
+    Args:
+        imgs (list of PIL.Image.Image): 要排列的图像列表
+        rows (int): 网格的行数
+        cols (int): 网格的列数
+
+    Returns:
+        PIL.Image.Image: 组合后的网格图像
+
+    Raises:
+        AssertionError: 如果图像数量不等于 rows * cols
+    """
     assert len(imgs) == rows * cols
 
     w, h = imgs[0].size
@@ -78,10 +121,33 @@ def image_grid(imgs, rows, cols):
 
 
 def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step):
+    """
+    运行验证并记录生成的图像。
+
+    该函数在训练过程中定期调用，用于评估当前模型在验证集上的表现，
+    并将生成的图像记录到 TensorBoard 或 WandB 等跟踪器中。
+
+    Args:
+        vae (AutoencoderKL): VAE 模型，用于图像编码和解码
+        unet (UNet2DConditionModel): UNet 模型
+        adapter (T2IAdapter): 正在训练的 T2I-Adapter 模型
+        args (argparse.Namespace): 命令行参数
+        accelerator (Accelerator): Accelerator 实例，用于分布式训练
+        weight_dtype (torch.dtype): 权重数据类型（如 torch.float16, torch.bfloat16）
+        step (int): 当前训练步数，用于日志记录
+
+    Returns:
+        list: 包含验证结果的字典列表，每个字典包含：
+            - validation_image: 条件图像
+            - images: 生成的图像列表
+            - validation_prompt: 对应的提示词
+    """
     logger.info("Running validation... ")
 
+    # 从分布式训练中解包适配器模型
     adapter = accelerator.unwrap_model(adapter)
 
+    # 创建推理管道
     pipeline = StableDiffusionXLAdapterPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
@@ -94,14 +160,17 @@ def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step):
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
+    # 启用 xformers 内存高效注意力（如果可用）
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
 
+    # 设置随机种子生成器
     if args.seed is None:
         generator = None
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
+    # 处理验证图像和提示词的配对
     if len(args.validation_image) == len(args.validation_prompt):
         validation_images = args.validation_image
         validation_prompts = args.validation_prompt
@@ -118,12 +187,14 @@ def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step):
 
     image_logs = []
 
+    # 对每个验证图像-提示词对进行推理
     for validation_prompt, validation_image in zip(validation_prompts, validation_images):
         validation_image = Image.open(validation_image).convert("RGB")
         validation_image = validation_image.resize((args.resolution, args.resolution))
 
         images = []
 
+        # 为每个条件生成多个图像（增加统计可靠性）
         for _ in range(args.num_validation_images):
             with torch.autocast("cuda"):
                 image = pipeline(
@@ -135,6 +206,7 @@ def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step):
             {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
         )
 
+    # 将图像记录到不同的跟踪器
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             for log in image_logs:
@@ -168,6 +240,7 @@ def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step):
         else:
             logger.warning(f"image logging not implemented for {tracker.name}")
 
+        # 清理内存
         del pipeline
         gc.collect()
         torch.cuda.empty_cache()
@@ -178,6 +251,23 @@ def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step):
 def import_model_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
 ):
+    """
+    根据模型名称或路径导入对应的文本编码器类。
+
+    SDXL 使用两个文本编码器：CLIPTextModel 和 CLIPTextModelWithProjection。
+    该函数通过读取模型的配置文件来确定使用哪个类。
+
+    Args:
+        pretrained_model_name_or_path (str): 预训练模型的名称或路径
+        revision (str): 模型版本（如 main、fp16 等）
+        subfolder (str, optional): 子文件夹名称，默认为 "text_encoder"
+
+    Returns:
+        type: 文本编码器类（CLIPTextModel 或 CLIPTextModelWithProjection）
+
+    Raises:
+        ValueError: 如果模型类不被支持
+    """
     text_encoder_config = PretrainedConfig.from_pretrained(
         pretrained_model_name_or_path, subfolder=subfolder, revision=revision
     )
@@ -196,6 +286,21 @@ def import_model_class_from_model_name_or_path(
 
 
 def save_model_card(repo_id: str, image_logs: dict = None, base_model: str = None, repo_folder: str = None):
+    """
+    创建并保存模型卡片（README.md）到输出目录。
+
+    模型卡片包含模型描述、训练信息、示例图像和必要的标签，
+    用于在 Hugging Face Hub 上展示模型。
+
+    Args:
+        repo_id (str): 仓库 ID，用于模型卡片标题
+        image_logs (dict, optional): 验证图像日志，包含生成的示例图像
+        base_model (str, optional): 基础模型名称（如 "stabilityai/stable-diffusion-xl-base-1.0"）
+        repo_folder (str, optional): 仓库文件夹路径，用于保存模型卡片
+
+    Returns:
+        None: 函数将模型卡片保存到 repo_folder/README.md
+    """
     img_str = ""
     if image_logs is not None:
         img_str = "You can find some example images below.\n"
@@ -203,18 +308,22 @@ def save_model_card(repo_id: str, image_logs: dict = None, base_model: str = Non
             images = log["images"]
             validation_prompt = log["validation_prompt"]
             validation_image = log["validation_image"]
+            # 保存条件图像
             validation_image.save(os.path.join(repo_folder, "image_control.png"))
             img_str += f"prompt: {validation_prompt}\n"
+            # 将条件图像和生成图像组合成网格
             images = [validation_image] + images
             image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
             img_str += f"![images_{i})](./images_{i}.png)\n"
 
+    # 构建模型描述
     model_description = f"""
 # t2iadapter-{repo_id}
 
 These are t2iadapter weights trained on {base_model} with new type of conditioning.
 {img_str}
 """
+    # 加载或创建模型卡片
     model_card = load_or_create_model_card(
         repo_id_or_path=repo_id,
         from_training=True,
@@ -224,6 +333,7 @@ These are t2iadapter weights trained on {base_model} with new type of conditioni
         inference=True,
     )
 
+    # 添加相关标签
     tags = [
         "stable-diffusion-xl",
         "stable-diffusion-xl-diffusers",
@@ -234,10 +344,26 @@ These are t2iadapter weights trained on {base_model} with new type of conditioni
     ]
     model_card = populate_model_card(model_card, tags=tags)
 
+    # 保存模型卡片
     model_card.save(os.path.join(repo_folder, "README.md"))
 
 
 def parse_args(input_args=None):
+    """
+    解析命令行参数。
+
+    该函数定义了 T2I-Adapter 训练脚本的所有可配置参数，
+    包括模型路径、训练超参数、数据集配置、验证设置等。
+
+    Args:
+        input_args (list, optional): 命令行参数列表。如果为 None，则从 sys.argv 读取。
+
+    Returns:
+        argparse.Namespace: 包含所有解析后参数的命名空间对象
+
+    Raises:
+        ValueError: 如果参数组合无效（如缺少必需参数或参数值无效）
+    """
     parser = argparse.ArgumentParser(description="Simple example of a ControlNet training script.")
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -620,13 +746,26 @@ def parse_args(input_args=None):
 
 
 def get_train_dataset(args, accelerator):
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+    """
+    加载和预处理训练数据集。
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
+    支持从 Hugging Face Hub 下载数据集或从本地目录加载。
+    数据集应包含三列：图像、条件图像和文本描述。
+
+    Args:
+        args (argparse.Namespace): 命令行参数
+        accelerator (Accelerator): Accelerator 实例，用于分布式训练中的进程同步
+
+    Returns:
+        Dataset: 预处理后的训练数据集
+
+    Raises:
+        ValueError: 如果指定的列名在数据集中不存在
+    """
+    # 获取数据集：可以从 Hugging Face Hub 下载或使用本地文件
+    # 在分布式训练中，load_dataset 函数确保只有一个本地进程同时下载数据集
     if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
+        # 从 Hub 下载和加载数据集
         dataset = load_dataset(
             args.dataset_name,
             args.dataset_config_name,
@@ -638,14 +777,13 @@ def get_train_dataset(args, accelerator):
                 args.train_data_dir,
                 cache_dir=args.cache_dir,
             )
-        # See more about loading custom images at
+        # 有关加载自定义图像的更多信息，请参阅：
         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
 
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
+    # 预处理数据集
     column_names = dataset["train"].column_names
 
-    # 6. Get the column names for input/target.
+    # 获取输入/目标的列名
     if args.image_column is None:
         image_column = column_names[0]
         logger.info(f"image column defaulting to {image_column}")
@@ -676,6 +814,7 @@ def get_train_dataset(args, accelerator):
                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
+    # 在主进程中先进行数据预处理，然后广播到其他进程
     with accelerator.main_process_first():
         train_dataset = dataset["train"].shuffle(seed=args.seed)
         if args.max_train_samples is not None:
@@ -685,20 +824,41 @@ def get_train_dataset(args, accelerator):
 
 # Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
 def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prompts, is_train=True):
+    """
+    对文本提示进行编码，生成文本嵌入。
+
+    SDXL 使用两个文本编码器，该函数将两个编码器的输出拼接起来。
+    支持空提示替换（用于 classifier-free guidance）。
+
+    Args:
+        prompt_batch (list): 文本提示列表
+        text_encoders (list): 文本编码器列表（两个）
+        tokenizers (list): 分词器列表（两个）
+        proportion_empty_prompts (float): 空提示的比例（0-1之间）
+        is_train (bool, optional): 是否为训练模式。在训练时从多个描述中随机选择，
+                                    在推理时选择第一个描述。默认为 True。
+
+    Returns:
+        tuple: 包含两个元素的元组：
+            - prompt_embeds (torch.Tensor): 拼接后的文本嵌入，形状为 (batch_size, seq_len, hidden_size*2)
+            - pooled_prompt_embeds (torch.Tensor): 池化后的文本嵌入，形状为 (batch_size, hidden_size)
+    """
     prompt_embeds_list = []
 
+    # 处理提示词：可能替换为空字符串（用于 classifier-free guidance）
     captions = []
     for caption in prompt_batch:
         if random.random() < proportion_empty_prompts:
-            captions.append("")
+            captions.append("")  # 空提示
         elif isinstance(caption, str):
             captions.append(caption)
         elif isinstance(caption, (list, np.ndarray)):
-            # take a random caption if there are multiple
+            # 如果有多个描述，训练时随机选择一个，推理时选择第一个
             captions.append(random.choice(caption) if is_train else caption[0])
 
     with torch.no_grad():
         for tokenizer, text_encoder in zip(tokenizers, text_encoders):
+            # 分词
             text_inputs = tokenizer(
                 captions,
                 padding="max_length",
@@ -707,45 +867,74 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
                 return_tensors="pt",
             )
             text_input_ids = text_inputs.input_ids
+            
+            # 文本编码
             prompt_embeds = text_encoder(
                 text_input_ids.to(text_encoder.device),
                 output_hidden_states=True,
             )
 
-            # We are only ALWAYS interested in the pooled output of the final text encoder
-            pooled_prompt_embeds = prompt_embeds[0]
-            prompt_embeds = prompt_embeds.hidden_states[-2]
+            # 我们只对最终文本编码器的池化输出感兴趣
+            pooled_prompt_embeds = prompt_embeds[0]  # 池化输出
+            prompt_embeds = prompt_embeds.hidden_states[-2]  # 倒数第二层的隐藏状态
             bs_embed, seq_len, _ = prompt_embeds.shape
             prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
             prompt_embeds_list.append(prompt_embeds)
 
+    # 拼接两个文本编码器的输出
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
     return prompt_embeds, pooled_prompt_embeds
 
 
 def prepare_train_dataset(dataset, accelerator):
+    """
+    对训练数据集进行预处理转换。
+
+    包括图像大小调整、中心裁剪、归一化等操作。
+    为图像和条件图像分别定义不同的转换管道。
+
+    Args:
+        dataset (Dataset): 原始数据集
+        accelerator (Accelerator): Accelerator 实例，用于进程同步
+
+    Returns:
+        Dataset: 应用了转换的数据集
+    """
+    # 目标图像的转换管道
     image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Normalize([0.5], [0.5]),  # 归一化到 [-1, 1] 范围
         ]
     )
 
+    # 条件图像的转换管道（不进行归一化，因为 T2I-Adapter 需要原始像素值）
     conditioning_image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
+            transforms.ToTensor(),  # 转换为张量，范围 [0, 1]
         ]
     )
 
     def preprocess_train(examples):
+        """
+        单个批次的预处理函数。
+
+        Args:
+            examples (dict): 包含图像、条件图像和文本的批次数据
+
+        Returns:
+            dict: 预处理后的批次，包含 pixel_values 和 conditioning_pixel_values
+        """
+        # 处理目标图像
         images = [image.convert("RGB") for image in examples[args.image_column]]
         images = [image_transforms(image) for image in images]
 
+        # 处理条件图像
         conditioning_images = [image.convert("RGB") for image in examples[args.conditioning_image_column]]
         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
 
@@ -754,6 +943,7 @@ def prepare_train_dataset(dataset, accelerator):
 
         return examples
 
+    # 在主进程中先进行数据转换，然后广播到其他进程
     with accelerator.main_process_first():
         dataset = dataset.with_transform(preprocess_train)
 
@@ -761,14 +951,38 @@ def prepare_train_dataset(dataset, accelerator):
 
 
 def collate_fn(examples):
+    """
+    数据加载器的批处理函数。
+
+    将多个样本组合成一个批次，并进行必要的张量转换和内存格式优化。
+
+    Args:
+        examples (list of dict): 样本列表，每个样本包含：
+            - pixel_values: 目标图像张量
+            - conditioning_pixel_values: 条件图像张量
+            - prompt_embeds: 文本嵌入
+            - text_embeds: 附加文本嵌入（用于 SDXL）
+            - time_ids: 时间 ID（用于 SDXL）
+
+    Returns:
+        dict: 批处理后的数据，包含：
+            - pixel_values: 目标图像批次
+            - conditioning_pixel_values: 条件图像批次
+            - prompt_ids: 文本嵌入批次
+            - unet_added_conditions: 包含 text_embeds 和 time_ids 的字典
+    """
+    # 堆叠目标图像
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
+    # 堆叠条件图像
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
 
+    # 堆叠文本嵌入
     prompt_ids = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
 
+    # 堆叠 SDXL 特有的附加条件
     add_text_embeds = torch.stack([torch.tensor(example["text_embeds"]) for example in examples])
     add_time_ids = torch.stack([torch.tensor(example["time_ids"]) for example in examples])
 
@@ -781,34 +995,63 @@ def collate_fn(examples):
 
 
 def main(args):
+    """
+    T2I-Adapter 训练主函数。
+
+    该函数负责：
+    1. 初始化训练环境（Accelerator、日志记录等）
+    2. 加载预训练模型（VAE、UNet、文本编码器、T2I-Adapter）
+    3. 准备数据集和数据加载器
+    4. 配置优化器和学习率调度器
+    5. 执行训练循环
+    6. 定期验证和保存检查点
+    7. 保存最终模型并上传到 Hub（如果启用）
+
+    Args:
+        args (argparse.Namespace): 命令行参数
+
+    Raises:
+        ValueError: 如果参数组合无效（如同时使用 wandb 和 hub_token）
+    """
+    # 安全检查：不能同时使用 wandb 和 hub_token，因为 wandb 可能会暴露 token
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
             " Please use `hf auth login` to authenticate with the Hub."
         )
 
+    # 设置日志目录
     logging_dir = Path(args.output_dir, args.logging_dir)
 
+    # 配置accelerator项目，设置了项目输出目录和日志目录
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
+    # 初始化 Accelerator（用于分布式训练、混合精度等）
+    # 混合精度就是传播的时候用fp16，更新权重的时候用fp32，fp16节省显存，计算速度更快，fp32更稳定
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
-        project_config=accelerator_project_config,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,   # 梯度积累步数
+        mixed_precision=args.mixed_precision,                           # 混合精度设置
+        log_with=args.report_to,                                        # 日志记录平台
+        project_config=accelerator_project_config,                      # 项目配置
     )
 
     # Disable AMP for MPS.
+    # mps平台关闭自动混合精度，支持不全
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
 
     # Make one log on every process with the configuration for debugging.
+    # 设置日志格式，时间格式，只显示info以上级别的日志
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+
+    # 所有的进程都会打印日志，而不仅仅是主进程
     logger.info(accelerator.state, main_process_only=False)
+
+    # 主进程的日志更详细
     if accelerator.is_local_main_process:
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
@@ -821,11 +1064,14 @@ def main(args):
         set_seed(args.seed)
 
     # Handle the repository creation
+    # 主进程的专属任务：创建输出目录和设置hugging face hub仓库
     if accelerator.is_main_process:
         if args.output_dir is not None:
+            # 创建输出目录
             os.makedirs(args.output_dir, exist_ok=True)
 
         if args.push_to_hub:
+            # 创建hugging face hub仓库
             repo_id = create_repo(
                 repo_id=args.hub_model_id or Path(args.output_dir).name,
                 exist_ok=True,
@@ -833,7 +1079,7 @@ def main(args):
                 private=True,
             ).repo_id
 
-    # Load the tokenizers
+    # 加载分词器（SDXL 使用两个分词器）
     tokenizer_one = AutoTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="tokenizer",
@@ -847,7 +1093,7 @@ def main(args):
         use_fast=False,
     )
 
-    # import correct text encoder classes
+    # 导入正确的文本编码器类
     text_encoder_cls_one = import_model_class_from_model_name_or_path(
         args.pretrained_model_name_or_path, args.revision
     )
@@ -855,7 +1101,7 @@ def main(args):
         args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
     )
 
-    # Load scheduler and models
+    # 加载调度器和模型组件
     noise_scheduler = EulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     text_encoder_one = text_encoder_cls_one.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
@@ -863,6 +1109,8 @@ def main(args):
     text_encoder_two = text_encoder_cls_two.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
     )
+
+    # 确定 VAE 路径：使用指定的 VAE 或默认 VAE
     vae_path = (
         args.pretrained_model_name_or_path
         if args.pretrained_vae_model_name_or_path is None
@@ -878,22 +1126,26 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
 
+    # 加载或初始化 T2I-Adapter
     if args.adapter_model_name_or_path:
+        # 加载t2i adapter
         logger.info("Loading existing adapter weights.")
         t2iadapter = T2IAdapter.from_pretrained(args.adapter_model_name_or_path)
     else:
+        # 初始化t2i adapter
         logger.info("Initializing t2iadapter weights.")
         t2iadapter = T2IAdapter(
-            in_channels=3,
-            channels=(320, 640, 1280, 1280),
-            num_res_blocks=2,
-            downscale_factor=16,
-            adapter_type="full_adapter_xl",
+            in_channels=3,  # 输入通道数（RGB 图像）
+            channels=(320, 640, 1280, 1280),  # 各层通道数
+            num_res_blocks=2,  # 每个分辨率块的残差块数量
+            downscale_factor=16,  # 下采样因子
+            adapter_type="full_adapter_xl",  # 适配器类型（针对 SDXL 的完整适配器）
         )
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+        # 保存和加载模型的钩子函数
         def save_model_hook(models, weights, output_dir):
             i = len(weights) - 1
 
@@ -926,6 +1178,8 @@ def main(args):
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
+
+    # 需要训练adapter和unet
     t2iadapter.train()
     unet.train()
 
@@ -938,16 +1192,19 @@ def main(args):
                 logger.warning(
                     "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
+            # 开启xformers高效注意力机制
             unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
     def unwrap_model(model):
-        model = accelerator.unwrap_model(model)
+        # 解包模型
+        model = accelerator.unwrap_model(model) 
         model = model._orig_mod if is_compiled_module(model) else model
         return model
 
     if args.gradient_checkpointing:
+        # 开启梯度检查点以节省内存
         unet.enable_gradient_checkpointing()
 
     # Check that all trainable models are in full precision
@@ -964,9 +1221,11 @@ def main(args):
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if args.allow_tf32:
+        # 开启tf32加速
         torch.backends.cuda.matmul.allow_tf32 = True
 
     if args.scale_lr:
+        # 如果需要缩放学习率，将原始学习率乘以一个缩放因子，这个因子考虑了梯度累积步数、批量大小和进程数
         args.learning_rate = (
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
@@ -979,12 +1238,13 @@ def main(args):
             raise ImportError(
                 "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
             )
-
+        # 8位Adam优化器类，显著减少深度学习训练时的内存占用
         optimizer_class = bnb.optim.AdamW8bit
     else:
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
+    # 创建优化器，只优化t2i adapter的参数
     params_to_optimize = t2iadapter.parameters()
     optimizer = optimizer_class(
         params_to_optimize,
@@ -996,6 +1256,7 @@ def main(args):
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
+    # 如果开启了混合精度，将仅用于推理的模型（文本编码器和VAE）转换为半精度
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -1015,20 +1276,42 @@ def main(args):
     # Here, we compute not just the text embeddings but also the additional embeddings
     # needed for the SD XL UNet to operate.
     def compute_embeddings(batch, proportion_empty_prompts, text_encoders, tokenizers, is_train=True):
+        """
+        计算文本嵌入和 SDXL UNet 所需的附加条件。
+
+        SDXL 需要额外的条件信息，如图像原始尺寸、裁剪坐标和目标尺寸。
+        这些信息被编码为 time_ids 并与文本嵌入一起传递给 UNet。
+
+        Args:
+            batch (dict): 数据批次，包含文本描述列
+            proportion_empty_prompts (float): 空提示的比例
+            text_encoders (list): 文本编码器列表
+            tokenizers (list): 分词器列表
+            is_train (bool, optional): 是否为训练模式。默认为 True。
+
+        Returns:
+            dict: 包含以下键的字典：
+                - prompt_embeds: 文本嵌入
+                - text_embeds: 池化文本嵌入（用于 SDXL 的附加条件）
+                - time_ids: 时间 ID（包含尺寸和裁剪信息）
+        """
         original_size = (args.resolution, args.resolution)
         target_size = (args.resolution, args.resolution)
         crops_coords_top_left = (args.crops_coords_top_left_h, args.crops_coords_top_left_w)
         prompt_batch = batch[args.caption_column]
 
+        # 编码文本提示
         prompt_embeds, pooled_prompt_embeds = encode_prompt(
             prompt_batch, text_encoders, tokenizers, proportion_empty_prompts, is_train
         )
         add_text_embeds = pooled_prompt_embeds
 
-        # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
+        # 从 pipeline.StableDiffusionXLPipeline._get_add_time_ids 改编
+        # 构建 time_ids：包含原始尺寸、裁剪坐标和目标尺寸
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
         add_time_ids = torch.tensor([add_time_ids])
 
+        # 移动到正确的设备和数据类型
         prompt_embeds = prompt_embeds.to(accelerator.device)
         add_text_embeds = add_text_embeds.to(accelerator.device)
         add_time_ids = add_time_ids.repeat(len(prompt_batch), 1)
@@ -1038,13 +1321,30 @@ def main(args):
         return {"prompt_embeds": prompt_embeds, **unet_added_cond_kwargs}
 
     def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        """
+        根据时间步获取对应的噪声调度器 sigma 值。
+
+        sigma 值用于缩放噪声，在 EDM 或 Karras 调度器中常用。
+        该函数将时间步映射到调度器中的对应 sigma 值。
+
+        Args:
+            timesteps (torch.Tensor): 时间步张量
+            n_dim (int, optional): 输出张量的目标维度。默认为 4。
+            dtype (torch.dtype, optional): 输出数据类型。默认为 torch.float32。
+
+        Returns:
+            torch.Tensor: sigma 值，形状为 (batch_size, 1, 1, 1)（当 n_dim=4 时）
+        """
         sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
         schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
         timesteps = timesteps.to(accelerator.device)
 
+        # 找到每个时间步在调度器时间步列表中的索引
         step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
 
         sigma = sigmas[step_indices].flatten()
+        
+        # 扩展维度以匹配输入张量的维度
         while len(sigma.shape) < n_dim:
             sigma = sigma.unsqueeze(-1)
         return sigma
@@ -1190,8 +1490,9 @@ def main(args):
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
 
-                # Cubic sampling to sample a random timestep for each image.
-                # For more details about why cubic sampling is used, refer to section 3.4 of https://huggingface.co/papers/2302.08453
+                # 立方采样：为每个图像采样一个随机时间步。
+                # 使用立方采样（cubic sampling）而不是均匀采样，以便更频繁地采样较小的时间步（更接近干净图像）。
+                # 这有助于模型更好地学习去噪过程。更多细节请参考 https://huggingface.co/papers/2302.08453 的第3.4节
                 timesteps = torch.rand((bsz,), device=latents.device)
                 timesteps = (1 - timesteps**3) * noise_scheduler.config.num_train_timesteps
                 timesteps = timesteps.long().to(noise_scheduler.timesteps.dtype)

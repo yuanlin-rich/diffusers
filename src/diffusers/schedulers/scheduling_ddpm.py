@@ -41,7 +41,10 @@ class DDPMSchedulerOutput(BaseOutput):
             `pred_original_sample` can be used to preview progress or for guidance.
     """
 
+    # 去噪的样本，作为下一次去噪的输出
     prev_sample: torch.Tensor
+
+    # 原始样本
     pred_original_sample: Optional[torch.Tensor] = None
 
 
@@ -69,33 +72,26 @@ def betas_for_alpha_bar(
         `torch.Tensor`:
             The betas used by the scheduler to step the model outputs.
     """
+    # 根据连续时间的alpha，计算离散时间的beta，beta就是每一步添加噪声的比例
     if alpha_transform_type == "cosine":
-
         def alpha_bar_fn(t):
             return math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
-
     elif alpha_transform_type == "laplace":
-
         def alpha_bar_fn(t):
             lmb = -0.5 * math.copysign(1, 0.5 - t) * math.log(1 - 2 * math.fabs(0.5 - t) + 1e-6)
             snr = math.exp(lmb)
             return math.sqrt(snr / (1 + snr))
-
     elif alpha_transform_type == "exp":
-
         def alpha_bar_fn(t):
             return math.exp(t * -12.0)
-
     else:
         raise ValueError(f"Unsupported alpha_transform_type: {alpha_transform_type}")
-
     betas = []
     for i in range(num_diffusion_timesteps):
         t1 = i / num_diffusion_timesteps
         t2 = (i + 1) / num_diffusion_timesteps
         betas.append(min(1 - alpha_bar_fn(t2) / alpha_bar_fn(t1), max_beta))
     return torch.tensor(betas, dtype=torch.float32)
-
 
 # Copied from diffusers.schedulers.scheduling_ddim.rescale_zero_terminal_snr
 def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
@@ -110,6 +106,7 @@ def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
         `torch.Tensor`:
             Rescaled betas with zero terminal SNR.
     """
+    # 将β调度重新缩放，使得最终时间步的信噪比(snr)为零
     # Convert betas to alphas_bar_sqrt
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -126,13 +123,11 @@ def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
 
     # Convert alphas_bar_sqrt to betas
-    alphas_bar = alphas_bar_sqrt**2  # Revert sqrt
+    alphas_bar = alphas_bar_sqrt ** 2  # Revert sqrt
     alphas = alphas_bar[1:] / alphas_bar[:-1]  # Revert cumprod
     alphas = torch.cat([alphas_bar[0:1], alphas])
     betas = 1 - alphas
-
     return betas
-
 
 class DDPMScheduler(SchedulerMixin, ConfigMixin):
     """
@@ -186,6 +181,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
+        # 加噪去噪步骤
         num_train_timesteps: int = 1000,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
@@ -204,6 +200,11 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         steps_offset: int = 0,
         rescale_betas_zero_snr: bool = False,
     ):
+        # 初始化函数
+        # 如果提供了训练使用的betas，则使用训练用的betas，否则根据beta_schedule类型生成beta序列
+        # 可选：应用零终端SNR重缩放
+        # 计算 α = 1 - β 和 ᾱ = ∏α (累计乘积)
+        # 初始化时间步序列为反向顺序（从最大到最小）
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
         elif beta_schedule == "linear":
@@ -215,7 +216,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         elif beta_schedule == "laplace":
-            self.betas = betas_for_alpha_bar(num_train_timesteps, alpha_transform_type="laplace")
+            self.betas = betas_for_alpha_bar(num_train_timesteps, alpha_transform_type = "laplace")
         elif beta_schedule == "sigmoid":
             # GeoDiff sigmoid schedule
             betas = torch.linspace(-6, 6, num_train_timesteps)
@@ -256,6 +257,8 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             `torch.Tensor`:
                 A scaled input sample.
         """
+        # 作用：与需要根据时间步缩放模型输入的其他调度器保持兼容性
+        # 说明：DDPM不需要缩放，直接返回输入。但有些调度器（如DDIM）需要此功能。
         return sample
 
     def set_timesteps(
@@ -279,6 +282,11 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
                 `num_inference_steps` must be `None`.
 
         """
+        # 作用：设置推理时实际使用的时间步序列
+        # 三种策略：
+        # "linspace"：等间距采样（如从1000步中均匀选50步）
+        # "leading"：密集采样开始部分（早期时间步更密集）
+        # "trailing"：密集采样结束部分（后期时间步更密集）
         if num_inference_steps is not None and timesteps is not None:
             raise ValueError("Can only pass one of `num_inference_steps` or `custom_timesteps`.")
 
@@ -357,6 +365,12 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             `torch.Tensor`:
                 The computed variance.
         """
+        # 作用：计算在反向过程中要添加的噪声方差
+        # 方差类型：
+        # "fixed_small"：小方差，更稳定
+        # "fixed_large"：大方差，更随机
+        # "learned"：从模型学习方差
+        # "learned_range"：学习方差范围
         prev_t = self.previous_timestep(t)
 
         alpha_prod_t = self.alphas_cumprod[t]
@@ -416,6 +430,12 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             `torch.Tensor`:
                 The thresholded sample.
         """
+        # 作用：防止像素值饱和的动态阈值方法
+        # 原理：
+        # 计算样本绝对值的特定百分位数（如99.5%）
+        # 将样本裁剪到 [-s, s] 范围内
+        # 除以 s 进行归一化
+        # 效果：避免像素值被限制在 [-1, 1] 而失去动态范围
         dtype = sample.dtype
         batch_size, channels, *remaining_dims = sample.shape
 
@@ -468,6 +488,8 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
                 If return_dict is `True`, [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] is returned, otherwise a
                 tuple is returned where the first element is the sample tensor.
         """
+        # 核心函数：执行一步去噪
+        # 作用：根据模型输出计算前一个时间步的样本
         t = timestep
 
         prev_t = self.previous_timestep(t)
@@ -478,6 +500,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             predicted_variance = None
 
         # 1. compute alphas, betas
+        # 计算alpha和beta
         alpha_prod_t = self.alphas_cumprod[t]
         alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
         beta_prod_t = 1 - alpha_prod_t
@@ -487,6 +510,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
 
         # 2. compute predicted original sample from predicted noise also called
         # "predicted x_0" of formula (15) from https://huggingface.co/papers/2006.11239
+        # 根据预测的噪声（model_output），计算去噪的结果
         if self.config.prediction_type == "epsilon":
             pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
         elif self.config.prediction_type == "sample":
@@ -500,6 +524,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             )
 
         # 3. Clip or threshold "predicted x_0"
+        # 限制样本范围，防止异常值
         if self.config.thresholding:
             pred_original_sample = self._threshold_sample(pred_original_sample)
         elif self.config.clip_sample:
@@ -566,6 +591,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
         # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
         # for the subsequent add_noise calls
+        # 作用：将噪声添加到原始样本中，模拟正向扩散过程
         self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
         alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
         timesteps = timesteps.to(original_samples.device)
@@ -600,6 +626,8 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
                 The computed velocity.
         """
         # Make sure alphas_cumprod and timestep have same device and dtype as sample
+        # 根据样本和噪声计算速度（velocity）
+        # 用途，当使用v_prediction预测类型时，模型预测的是速度v而不是噪声ε
         self.alphas_cumprod = self.alphas_cumprod.to(device=sample.device)
         alphas_cumprod = self.alphas_cumprod.to(dtype=sample.dtype)
         timesteps = timesteps.to(sample.device)
@@ -618,6 +646,8 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         return velocity
 
     def __len__(self) -> int:
+        # 作用：返回训练时间步总数
+        # 用途：使调度器对象可迭代
         return self.config.num_train_timesteps
 
     def previous_timestep(self, timestep: int) -> int:
@@ -632,6 +662,10 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             `int`:
                 The previous timestep.
         """
+        # 作用：根据当前时间步获取前一个时间步
+        # 逻辑：
+        # 如果使用自定义时间步或推理时间步，从时间步列表中查找
+        # 否则简单减1
         if self.custom_timesteps or self.num_inference_steps:
             index = (self.timesteps == timestep).nonzero(as_tuple=True)[0][0]
             if index == self.timesteps.shape[0] - 1:

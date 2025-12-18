@@ -216,31 +216,37 @@ class ResnetBlock2D(nn.Module):
         conv_2d_out_channels (`int`, *optional*, default to `None`): the number of channels in the output.
             If None, same as `out_channels`.
     """
-
+    #   输入 → [可选上/下采样] → 残差连接
+    #     ↓
+    #   Norm1 → 激活 → Conv1 → [时间嵌入注入] → Norm2 → 激活 → Dropout → Conv2
+    #     ↑                                                                  ↓
+    #      └──────────────────────── 相加 ────────────────────────────────┘
+    #                               ↓
+    #                         output_scale_factor
     def __init__(
         self,
-        *,
-        in_channels: int,
-        out_channels: Optional[int] = None,
-        conv_shortcut: bool = False,
-        dropout: float = 0.0,
-        temb_channels: int = 512,
-        groups: int = 32,
-        groups_out: Optional[int] = None,
+        in_channels: int,                               # 输入通道数
+        out_channels: Optional[int] = None,             # 输出通道数
+        conv_shortcut: bool = False,                    # 是否使用“捷径”
+        dropout: float = 0.0,                           # dropout概率，默认是0
+        temb_channels: int = 512,                       # 时间嵌入条件的维度
+        groups: int = 32,                               # group norm的输入数量
+        groups_out: Optional[int] = None,               # group norm的输出数量
         pre_norm: bool = True,
-        eps: float = 1e-6,
-        non_linearity: str = "swish",
-        skip_time_act: bool = False,
-        time_embedding_norm: str = "default",  # default, scale_shift,
+        eps: float = 1e-6,                              # 
+        non_linearity: str = "swish",                   # 非线形激活的类型
+        skip_time_act: bool = False,                    # 是否跳过时间嵌入维度的非线形激活
+        time_embedding_norm: str = "default",           # 时间嵌入的归一化方式，default, scale_shift,
         kernel: Optional[torch.Tensor] = None,
-        output_scale_factor: float = 1.0,
-        use_in_shortcut: Optional[bool] = None,
-        up: bool = False,
-        down: bool = False,
-        conv_shortcut_bias: bool = True,
+        output_scale_factor: float = 1.0,               # 输出的缩放系数
+        use_in_shortcut: Optional[bool] = None,         # 是否使用use_in_shortcut
+        up: bool = False,                               # 使用做上采样
+        down: bool = False,                             # 是否做下采样
+        conv_shortcut_bias: bool = True,                # 捷径是否添加偏移量
         conv_2d_out_channels: Optional[int] = None,
     ):
         super().__init__()
+        # ResnetBlock2D的时间嵌入不支持ada_group和spatial这两种方式，如果想使用需要用ResnetBlockCondNorm2D类
         if time_embedding_norm == "ada_group":
             raise ValueError(
                 "This class cannot be used with `time_embedding_norm==ada_group`, please use `ResnetBlockCondNorm2D` instead",
@@ -250,17 +256,35 @@ class ResnetBlock2D(nn.Module):
                 "This class cannot be used with `time_embedding_norm==spatial`, please use `ResnetBlockCondNorm2D` instead",
             )
 
+        # 这个根本用不上
         self.pre_norm = True
+
+        # 输入通道数
         self.in_channels = in_channels
+
+        # 输出通道数，默认等于输入通道数
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
+
+        # 是否使用“捷径”
         self.use_conv_shortcut = conv_shortcut
+
+        # 是否做上采样
         self.up = up
+
+        # 是否做下采样
         self.down = down
+
+        # ResnetBlock2D输出缩放系数
         self.output_scale_factor = output_scale_factor
+
+        # 时间嵌入条件的归一化方式
         self.time_embedding_norm = time_embedding_norm
+
+        # 是否跳过时间嵌入条件的非线形激活
         self.skip_time_act = skip_time_act
 
+        # group norm的输出数量
         if groups_out is None:
             groups_out = groups
 
@@ -268,12 +292,16 @@ class ResnetBlock2D(nn.Module):
 
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
+        # 如果设置了时间嵌入条件的维度
         if temb_channels is not None:
             if self.time_embedding_norm == "default":
+                # 默认方式，使用Linear将temb_channels映射为out_channels
                 self.time_emb_proj = nn.Linear(temb_channels, out_channels)
             elif self.time_embedding_norm == "scale_shift":
+                # scale_shift方式，使用Linear将temb_channels映射为2 * out_channels
                 self.time_emb_proj = nn.Linear(temb_channels, 2 * out_channels)
             else:
+                # ResnetBlock2D中不支持其他时间嵌入条件的归一化方式
                 raise ValueError(f"unknown time_embedding_norm : {self.time_embedding_norm} ")
         else:
             self.time_emb_proj = None
@@ -281,6 +309,8 @@ class ResnetBlock2D(nn.Module):
         self.norm2 = torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
 
         self.dropout = torch.nn.Dropout(dropout)
+
+        # 第二次卷积，通道数量从out_channels映射到conv_2d_out_channels
         conv_2d_out_channels = conv_2d_out_channels or out_channels
         self.conv2 = nn.Conv2d(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
 
@@ -288,6 +318,7 @@ class ResnetBlock2D(nn.Module):
 
         self.upsample = self.downsample = None
         if self.up:
+            # 上采样
             if kernel == "fir":
                 fir_kernel = (1, 3, 3, 1)
                 self.upsample = lambda x: upsample_2d(x, kernel=fir_kernel)
@@ -296,6 +327,7 @@ class ResnetBlock2D(nn.Module):
             else:
                 self.upsample = Upsample2D(in_channels, use_conv=False)
         elif self.down:
+            # 下采样
             if kernel == "fir":
                 fir_kernel = (1, 3, 3, 1)
                 self.downsample = lambda x: downsample_2d(x, kernel=fir_kernel)
@@ -306,6 +338,7 @@ class ResnetBlock2D(nn.Module):
 
         self.use_in_shortcut = self.in_channels != conv_2d_out_channels if use_in_shortcut is None else use_in_shortcut
 
+        # 残差网络中的捷径
         self.conv_shortcut = None
         if self.use_in_shortcut:
             self.conv_shortcut = nn.Conv2d(
@@ -318,15 +351,22 @@ class ResnetBlock2D(nn.Module):
             )
 
     def forward(self, input_tensor: torch.Tensor, temb: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        # 输出 = 主路径(输入) + 捷径(输入)
+
         if len(args) > 0 or kwargs.get("scale", None) is not None:
+            # 如果用户提供了scale参数，发出警告
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
             deprecate("scale", "1.0.0", deprecation_message)
 
         hidden_states = input_tensor
 
+        # 归一化
         hidden_states = self.norm1(hidden_states)
+
+        # 非线形激活
         hidden_states = self.nonlinearity(hidden_states)
 
+        # 上采样（可选）
         if self.upsample is not None:
             # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
             if hidden_states.shape[0] >= 64:
@@ -338,18 +378,24 @@ class ResnetBlock2D(nn.Module):
             input_tensor = self.downsample(input_tensor)
             hidden_states = self.downsample(hidden_states)
 
+        # 卷积
         hidden_states = self.conv1(hidden_states)
 
+        # 时间嵌入信息
         if self.time_emb_proj is not None:
             if not self.skip_time_act:
                 temb = self.nonlinearity(temb)
+            # 投影后的时间嵌入从形状 (B, C) 变为 (B, C, 1, 1)。
+            # 可以通过广播机制与形状为 (B, C, H, W) 的隐藏状态相加
             temb = self.time_emb_proj(temb)[:, :, None, None]
 
         if self.time_embedding_norm == "default":
+            # 默认方式，hidden_states + temb相加后归一化
             if temb is not None:
                 hidden_states = hidden_states + temb
             hidden_states = self.norm2(hidden_states)
         elif self.time_embedding_norm == "scale_shift":
+            # 将temb分成scale和shift两部分
             if temb is None:
                 raise ValueError(
                     f" `temb` should not be None when `time_embedding_norm` is {self.time_embedding_norm}"
@@ -360,11 +406,16 @@ class ResnetBlock2D(nn.Module):
         else:
             hidden_states = self.norm2(hidden_states)
 
+        # 非线形激活
         hidden_states = self.nonlinearity(hidden_states)
 
+        # dropout
         hidden_states = self.dropout(hidden_states)
+
+        # 卷积
         hidden_states = self.conv2(hidden_states)
 
+        # 残差连接中的“捷径”
         if self.conv_shortcut is not None:
             input_tensor = self.conv_shortcut(input_tensor.contiguous())
 
@@ -492,6 +543,7 @@ class TemporalConvLayer(nn.Module):
         self.out_dim = out_dim
 
         # conv layers
+        # 卷积层，卷积的维度是（3，1，1），也就是对时间，高度，宽度三个维度上做卷积，此外还有通道数的变化
         self.conv1 = nn.Sequential(
             nn.GroupNorm(norm_num_groups, in_dim),
             nn.SiLU(),
@@ -521,6 +573,10 @@ class TemporalConvLayer(nn.Module):
         nn.init.zeros_(self.conv4[-1].bias)
 
     def forward(self, hidden_states: torch.Tensor, num_frames: int = 1) -> torch.Tensor:
+        # hidden_states，输入: (B * T, C, H, W)  # B = batch, T = 帧数, C = 通道, H = 高, W = 宽
+        # hidden_states[None, :]，在张量最前面添加一个维度，形状变化: (B * T, C, H, W) → (1, B * T, C, H, W)
+        # reshape，重组成5D张量，形状变化: (1, B * T, C, H, W) → (B, T, C, H, W)
+        # permute，调整维度顺序，形状变化: (B, T, C, H, W) → (B, C, T, H, W)
         hidden_states = (
             hidden_states[None, :].reshape((-1, num_frames) + hidden_states.shape[1:]).permute(0, 2, 1, 3, 4)
         )
@@ -533,6 +589,7 @@ class TemporalConvLayer(nn.Module):
 
         hidden_states = identity + hidden_states
 
+        # 恢复输入的形状(B * T, C, H, W)
         hidden_states = hidden_states.permute(0, 2, 1, 3, 4).reshape(
             (hidden_states.shape[0] * hidden_states.shape[2], -1) + hidden_states.shape[3:]
         )

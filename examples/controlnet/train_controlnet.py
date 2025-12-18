@@ -67,6 +67,8 @@ logger = get_logger(__name__)
 
 
 def image_grid(imgs, rows, cols):
+    # 接受一个图像列表imgs和行数rows、列数cols
+    # 然后将这些图像按照指定的行数和列数排列成一个网格，并返回这个网格图像
     assert len(imgs) == rows * cols
 
     w, h = imgs[0].size
@@ -80,13 +82,17 @@ def image_grid(imgs, rows, cols):
 def log_validation(
     vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False
 ):
+    # 验证（或测试）ControlNet训练过程
     logger.info("Running validation... ")
 
     if not is_final_validation:
+        # 训练中的验证，从当前加速器包装的ControlNet模型中获取模型
         controlnet = accelerator.unwrap_model(controlnet)
     else:
-        controlnet = ControlNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
+        # 最终测试完成的验证，从输出目录加载ControlNet模型
+        controlnet = ControlNetModel.from_pretrained(args.output_dir, torch_dtype = weight_dtype)
 
+    # 推理管道
     pipeline = StableDiffusionControlNetPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
@@ -99,10 +105,13 @@ def log_validation(
         variant=args.variant,
         torch_dtype=weight_dtype,
     )
+
+    # 使用UniPC采样器
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
+    # 使用xformers进行内存高效的注意力计算
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
 
@@ -111,6 +120,7 @@ def log_validation(
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
+    # 处理提示词和控制图像的对应关系
     if len(args.validation_image) == len(args.validation_prompt):
         validation_images = args.validation_image
         validation_prompts = args.validation_prompt
@@ -129,6 +139,7 @@ def log_validation(
     inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
 
     for validation_prompt, validation_image in zip(validation_prompts, validation_images):
+        # 为每个提示词和控制图像对生成多个图像
         validation_image = Image.open(validation_image).convert("RGB")
 
         images = []
@@ -141,10 +152,12 @@ def log_validation(
 
             images.append(image)
 
+        # 记录控制图像，生成图像列表，提示词
         image_logs.append(
             {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
         )
 
+    # 将验证结果记录到tensorboard或wandb中
     tracker_key = "test" if is_final_validation else "validation"
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
@@ -187,6 +200,7 @@ def log_validation(
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
+    # 加载文本编码器配置，返回对应的文本编码器类
     text_encoder_config = PretrainedConfig.from_pretrained(
         pretrained_model_name_or_path,
         subfolder="text_encoder",
@@ -207,7 +221,11 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
 
 
 def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None):
+    # 保存模型卡片（README.md）
+    # 用于将模型上传到Hugging Face Hub时生成说明文档
     img_str = ""
+
+    # 如果提供了图像日志，则将一些示例图像添加到模型卡片中
     if image_logs is not None:
         img_str = "You can find some example images below.\n\n"
         for i, log in enumerate(image_logs):
@@ -220,6 +238,7 @@ def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=N
             image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
             img_str += f"![images_{i})](./images_{i}.png)\n"
 
+    # 模型描述，包括基础模型信息和示例图像
     model_description = f"""
 # controlnet-{repo_id}
 
@@ -605,6 +624,7 @@ def make_train_dataset(args, tokenizer, accelerator):
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
+    # 创建训练数据集，可以提供名字从huggingface hub下载，或者本地路径加载
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
@@ -627,6 +647,7 @@ def make_train_dataset(args, tokenizer, accelerator):
     column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
+    # 目标图像列
     if args.image_column is None:
         image_column = column_names[0]
         logger.info(f"image column defaulting to {image_column}")
@@ -637,6 +658,7 @@ def make_train_dataset(args, tokenizer, accelerator):
                 f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
+    # 文本提示词列
     if args.caption_column is None:
         caption_column = column_names[1]
         logger.info(f"caption column defaulting to {caption_column}")
@@ -647,6 +669,7 @@ def make_train_dataset(args, tokenizer, accelerator):
                 f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
+    # 控制图像列
     if args.conditioning_image_column is None:
         conditioning_image_column = column_names[2]
         logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
@@ -657,25 +680,36 @@ def make_train_dataset(args, tokenizer, accelerator):
                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
+    # 文本描述编码
     def tokenize_captions(examples, is_train=True):
         captions = []
         for caption in examples[caption_column]:
             if random.random() < args.proportion_empty_prompts:
+                # 允许一定概率使用空的文本描述
                 captions.append("")
             elif isinstance(caption, str):
+                # 字符串描述
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
                 # take a random caption if there are multiple
+                # 多个文本描述的时候，随机选择一个
                 captions.append(random.choice(caption) if is_train else caption[0])
             else:
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
+        # 使用tokenizer处理所有描述
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
 
+    # 处理目标图像
+    # 调整大小：缩放到指定分辨率（如512×512）
+    # 中心裁剪：确保正方形
+    # 转换为张量：像素值从[0,255]变为[0,1]
+    # 归一化：从[0,1]归一化到[-1,1]（Stable Diffusion的标准范围）
+    # 控制图像变换
     image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -685,6 +719,7 @@ def make_train_dataset(args, tokenizer, accelerator):
         ]
     )
 
+    # 处理控制图像，不进行归一化
     conditioning_image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -693,6 +728,11 @@ def make_train_dataset(args, tokenizer, accelerator):
         ]
     )
 
+    # 完整预处理函数
+    # 输出格式：每个样本包含三个关键字段：
+    # pixel_values：目标图像，形状为[3, H, W]，值范围[-1,1]
+    # conditioning_pixel_values：控制图像，形状为[3, H, W]，值范围[0,1]
+    # input_ids：tokenized文本，形状为[sequence_length]，通常是[77]
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         images = [image_transforms(image) for image in images]
@@ -716,6 +756,7 @@ def make_train_dataset(args, tokenizer, accelerator):
 
 
 def collate_fn(examples):
+    # 将多个样本处理成一个batch
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
@@ -851,6 +892,7 @@ def main(args):
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
+    # 只训练controlnet
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -1074,6 +1116,7 @@ def main(args):
                 )
 
                 # Predict the noise residual
+                # 这里需要查看unet的定义
                 model_pred = unet(
                     noisy_latents,
                     timesteps,

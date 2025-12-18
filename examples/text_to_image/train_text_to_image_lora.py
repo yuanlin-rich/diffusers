@@ -542,6 +542,7 @@ def main():
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # Add adapter and make sure the trainable params are in float32.
+    # lora相关
     unet.add_adapter(unet_lora_config)
     if args.mixed_precision == "fp16":
         # only upcast trainable parameters (LoRA) into fp32
@@ -560,6 +561,7 @@ def main():
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
+    # lora参数
     lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
 
     if args.gradient_checkpointing:
@@ -588,6 +590,7 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
+    # 只训练lora的参数
     optimizer = optimizer_cls(
         lora_layers,
         lr=args.learning_rate,

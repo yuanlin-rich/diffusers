@@ -109,7 +109,7 @@ class AutoencoderKL(
             layers_per_block=layers_per_block,
             act_fn=act_fn,
             norm_num_groups=norm_num_groups,
-            double_z=True,
+            double_z=True,                                     
             mid_block_add_attention=mid_block_add_attention,
         )
 
